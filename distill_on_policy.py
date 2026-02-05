@@ -5,8 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cloudpickle
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset
-from liger_kernel.transformers import AutoLigerKernelForCausalLM, LigerFusedLinearJSD
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from torchao.optim import AdamW4bit
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -18,13 +19,15 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
-#DATASET = "allenai/Dolci-Think-RL-7B"
+# DATASET = "allenai/Dolci-Think-RL-7B"
 DATASET = "allenai/Dolci-Instruct-RL"
 TEACHER = "allenai/Olmo-3-7B-Instruct"
 STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
 HUB_REPO = "hbfreed/Olmo-2-1B-Distilled"
 WANDB_PROJECT = "olmo-2-1b-on-policy-distillation"
-RUN_NAME = "instruct-student-instruct-teacher"  # set to a string to override auto naming
+RUN_NAME = (
+    "instruct-student-instruct-teacher"  # set to a string to override auto naming
+)
 
 STUDENT_DEVICE = "cuda:2"  # HF student for training
 TEACHER_DEVICE = "cuda:1"  # HF teacher for inference
@@ -45,6 +48,11 @@ PROFILE_STEPS = 0  # Set to 0 to disable profiling (uses lots of RAM)
 torch.manual_seed(1223)
 
 
+def get_logprobs_at_tokens(logits, tokens):
+    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
+    return log_probs.gather(-1, tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
+
+
 def generate_rollouts(
     vllm_student, batch, pad_token_id, group_size=1, max_context_length=4096
 ):
@@ -62,6 +70,7 @@ def generate_rollouts(
         top_p=1.0,
         max_tokens=max_new_tokens,
         n=group_size,
+        logprobs=1,
     )
 
     token_prompts = [{"prompt_token_ids": p} for p in prompts]
@@ -73,27 +82,57 @@ def generate_rollouts(
     # Convert vLLM outputs to tensor: each RequestOutput has `outputs` list
     # With n=group_size, we get group_size completions per prompt
     all_sequences = []
+    all_logprobs = []
     for req_output, prompt_len in zip(outputs, prompt_lens):
         prompt_ids = req_output.prompt_token_ids
         for completion in req_output.outputs:
             # Combine prompt + generated tokens
             full_seq = list(prompt_ids) + list(completion.token_ids)
             all_sequences.append(full_seq)
+            seq_logprobs = [0.0] * prompt_len
+            for idx, logprob_dict in enumerate(completion.logprobs):
+                token_id = completion.token_ids[idx]
+                seq_logprobs.append(logprob_dict[token_id].logprob)
+            all_logprobs.append(seq_logprobs)
 
     # Pad sequences to same length (right pad with pad_token_id)
     max_seq_len = max(len(seq) for seq in all_sequences)
     padded = [seq + [pad_token_id] * (max_seq_len - len(seq)) for seq in all_sequences]
+    padded_logprobs = [
+        logprob + [0.0] * (max_seq_len - len(logprob)) for logprob in all_logprobs
+    ]
 
     sequences = torch.tensor(padded)
-    return sequences, max_prompt_len
+    attention_mask = (sequences != pad_token_id).long()
+    old_logprobs = torch.tensor(padded_logprobs)
+    expanded_prompt_lens = [pl for pl in prompt_lens for _ in range(group_size)]
+
+    return sequences, expanded_prompt_lens, old_logprobs, attention_mask
 
 
-def create_shift_labels(sequences, prompt_len, pad_token_id, ignore_index=-100):
-    """Create shifted labels masking prompt and padding tokens for loss computation."""
-    labels = sequences.clone()
-    labels[:, :prompt_len] = ignore_index
-    labels[labels == pad_token_id] = ignore_index
-    return labels.view(-1)
+def build_loss_mask(sequences, prompt_lens, pad_token_id):
+    """
+    Build a mask that's 1.0 for completion tokens, 0.0 for prompt and padding.
+
+    sequences: [batch, seq_len]
+    prompt_lens: list[int], length = batch (per-sequence prompt lengths)
+    pad_token_id: int
+
+    Returns: [batch, seq_len - 1] (shifted to match logprob indexing)
+    """
+    batch_size, seq_len = sequences.shape
+    mask = torch.ones(batch_size, seq_len, device=sequences.device)
+
+    # Mask prompt tokens per sequence
+    for i, pl in enumerate(prompt_lens):
+        mask[i, :pl] = 0.0
+
+    # Mask padding
+    mask[sequences == pad_token_id] = 0.0
+
+    # Shift to align with logprob indexing (logits[t] predicts token[t+1])
+    # We want to mask based on whether token[t+1] is a completion token
+    return mask[:, 1:]
 
 
 def save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo=None):
@@ -216,16 +255,6 @@ def main():
     # This adds 74 new tokens initialized randomly (won't be used in practice)
     teacher.resize_token_embeddings(100352)
 
-    # Save references before torch.compile (compiled models need special attribute access)
-    student_base_model = student.model  # Base transformer without lm_head
-    teacher_base_model = teacher.model
-    student_lm_head_weight = student.lm_head.weight  # Will have gradients
-    teacher_lm_head_weight = teacher.lm_head.weight.to(
-        STUDENT_DEVICE
-    )  # Copy for fused kernel
-    student_hidden_size = student.config.hidden_size
-    teacher_hidden_size = teacher.config.hidden_size
-
     # Initialize vLLM for fast generation on separate GPU
     # skip_tokenizer_init=True since we input token IDs directly
     print(f"Loading vLLM student on {VLLM_DEVICE}...")
@@ -237,8 +266,8 @@ def main():
     )
 
     print("Compiling models with torch.compile...")
-    student_base_model = torch.compile(student_base_model)
-    teacher_base_model = torch.compile(teacher_base_model)
+    student = torch.compile(student)
+    teacher = torch.compile(teacher)
 
     optimizer = AdamW4bit(student.parameters(), lr=LR)
 
@@ -246,10 +275,6 @@ def main():
     if RESUME_FROM:
         start_step = load_checkpoint(RESUME_FROM, student, optimizer, vllm_student)
         print(f"Resuming from step {start_step}")
-
-    fused_jsd = LigerFusedLinearJSD(
-        jsd_beta=1.0, temperature=1.0
-    )  # beta=1.0 is reverse kl
 
     def short_name(model_name: str) -> str:
         return model_name.split("/")[-1]
@@ -314,7 +339,9 @@ def main():
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=PROFILE_STEPS, repeat=1),
+            schedule=torch.profiler.schedule(
+                wait=1, warmup=1, active=PROFILE_STEPS, repeat=1
+            ),
             on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_logs"),
             record_shapes=True,
             with_stack=True,
@@ -344,16 +371,24 @@ def main():
             # Get sequences: either from prefetch or generate synchronously (first batch)
             if prefetch_future is not None:
                 prefetch_wait_start = time.time()
-                sequences, prompt_len = prefetch_future.result()
+                sequences, prompt_len, old_student_logprobs, attention_mask = (
+                    prefetch_future.result()
+                )
                 prefetch_wait_sec = time.time() - prefetch_wait_start
                 gen_time = time.time() - prefetch_start_time
             else:
                 gen_start_time = time.time()
                 gen_future = vllm_executor.submit(
                     generate_rollouts,
-                    vllm_student, batch, PAD_TOKEN_ID, group_size, max_context
+                    vllm_student,
+                    batch,
+                    PAD_TOKEN_ID,
+                    group_size,
+                    max_context,
                 )
-                sequences, prompt_len = gen_future.result()
+                sequences, prompt_len, old_student_logprobs, attention_mask = (
+                    gen_future.result()
+                )
                 gen_time = time.time() - gen_start_time
                 prefetch_wait_sec = 0.0
 
@@ -363,49 +398,58 @@ def main():
                 prefetch_start_time = time.time()
                 prefetch_future = vllm_executor.submit(
                     generate_rollouts,
-                    vllm_student, next_batch, PAD_TOKEN_ID, group_size, max_context
+                    vllm_student,
+                    next_batch,
+                    PAD_TOKEN_ID,
+                    group_size,
+                    max_context,
                 )
             else:
                 prefetch_future = None
-            num_generated_tokens = (sequences.shape[1] - prompt_len) * sequences.shape[
-                0
-            ]
-            tokens_per_sec = num_generated_tokens / gen_time if gen_time > 0 else 0
             prefetch_wait_accum += prefetch_wait_sec
             prefetch_wait_count += 1
 
             # Move inputs once
             student_input = sequences.to(STUDENT_DEVICE, non_blocking=True)
+            student_mask = attention_mask.to(STUDENT_DEVICE, non_blocking=True)
             teacher_input = sequences.to(TEACHER_DEVICE, non_blocking=True)
+            teacher_mask = attention_mask.to(TEACHER_DEVICE, non_blocking=True)
 
-            # Create shift labels on GPU to avoid CPU->GPU copy
-            shift_labels = create_shift_labels(student_input, prompt_len, PAD_TOKEN_ID)
-
-            # Get hidden states (not logits!) for fused kernel
-            student_out = student_base_model(input_ids=student_input)
-            student_hidden = student_out.last_hidden_state.view(-1, student_hidden_size)
-
-            # Teacher forward without gradients
             with torch.inference_mode():
-                teacher_out = teacher_base_model(input_ids=teacher_input)
-                teacher_hidden = teacher_out.last_hidden_state.view(
-                    -1, teacher_hidden_size
+                teacher_out = teacher(
+                    input_ids=teacher_input,
+                    attention_mask=teacher_mask,
                 )
-                teacher_hidden = teacher_hidden.to(STUDENT_DEVICE, non_blocking=True).detach()
+                teacher_logits = teacher_out.logits
 
-            # Fused loss (hidden states + weights -> loss directly, no logits materialized)
-            loss = fused_jsd(
-                student_hidden,
-                student_lm_head_weight,
-                teacher_hidden,
-                teacher_lm_head_weight,
-                shift_labels,
+            teacher_logprobs = (
+                get_logprobs_at_tokens(teacher_logits, teacher_input)
+                .to(STUDENT_DEVICE)
+                .detach()
             )
 
+            student_out = student(
+                input_ids=student_input,
+                attention_mask=student_mask,
+            )
+            current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input)
+
+            loss_mask = build_loss_mask(student_input, prompt_len, PAD_TOKEN_ID)
+
+            num_generated_tokens = loss_mask.sum().item()
+            tokens_per_sec = num_generated_tokens / gen_time if gen_time > 0 else 0
+
+            old_logprobs_shifted = old_student_logprobs[:, 1:].to(STUDENT_DEVICE)
+            advantage = -(old_logprobs_shifted - teacher_logprobs)
+
+            ratio = torch.exp(current_logprobs - old_logprobs_shifted)
+            per_token_loss = -(ratio * advantage.detach())
+            masked_loss = (per_token_loss * loss_mask).sum() / loss_mask.sum()
+
             # Scale loss for gradient accumulation
-            scaled_loss = loss / GRAD_ACCUM_STEPS
+            scaled_loss = masked_loss / GRAD_ACCUM_STEPS
             scaled_loss.backward()
-            accumulated_loss += loss.item()
+            accumulated_loss += scaled_loss.item()
 
             # Optimizer step every GRAD_ACCUM_STEPS
             if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
@@ -444,6 +488,12 @@ def main():
                     "train/prefetch_wait_sec": avg_prefetch_wait,
                     "train/learning_rate": LR,
                     "train/global_step": global_step,
+                    # Policy gradient diagnostics
+                    "train/mean_advantage": (advantage * loss_mask).sum().item() / loss_mask.sum().item(),
+                    "train/mean_ratio": (ratio * loss_mask).sum().item() / loss_mask.sum().item(),
+                    "train/mean_kl": ((old_logprobs_shifted - teacher_logprobs) * loss_mask).sum().item() / loss_mask.sum().item(),
+                    "train/ratio_clipped_frac": ((ratio > 1.2) | (ratio < 0.8)).float().mean().item(),
+                    "train/approx_policy_drift": (current_logprobs - old_logprobs_shifted).abs().mean().item(),
                 }
                 if opt_step_time is not None:
                     log_payload["train/optimizer_step_time_sec"] = opt_step_time
@@ -475,7 +525,11 @@ def main():
                         checkpoint_future.result()
                     checkpoint_future = checkpoint_executor.submit(
                         save_checkpoint,
-                        student, tokenizer, optimizer, global_step, hub_repo
+                        student,
+                        tokenizer,
+                        optimizer,
+                        global_step,
+                        hub_repo,
                     )
 
             # Profiler step
@@ -483,7 +537,9 @@ def main():
                 profiler.step()
                 if global_step >= PROFILE_STEPS + 2:  # wait + warmup + active
                     profiler.stop()
-                    print(f"Profiler stopped. View with: tensorboard --logdir=./profiler_logs")
+                    print(
+                        f"Profiler stopped. View with: tensorboard --logdir=./profiler_logs"
+                    )
                     profiler = None
 
     pbar.close()
