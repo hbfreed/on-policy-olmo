@@ -15,4 +15,5 @@ dependencies = [
     "flash-attn>=2.8.3",
     "hf-transfer>=0.1.9",
     "vllm>=0.15.0",
+    "openbench>=0.5.3",
 ]

@@ -18,12 +18,13 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
-DATASET = "allenai/Dolci-Think-RL-7B"
-TEACHER = "allenai/Olmo-3-7B-Think"
-STUDENT = "allenai/OLMo-2-0425-1B"
+#DATASET = "allenai/Dolci-Think-RL-7B"
+DATASET = "allenai/Dolci-Instruct-RL"
+TEACHER = "allenai/Olmo-3-7B-Instruct"
+STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
 HUB_REPO = "hbfreed/Olmo-2-1B-Distilled"
 WANDB_PROJECT = "olmo-2-1b-on-policy-distillation"
-RUN_NAME = None  # set to a string to override auto naming
+RUN_NAME = "instruct-student-instruct-teacher"  # set to a string to override auto naming
 
 STUDENT_DEVICE = "cuda:2"  # HF student for training
 TEACHER_DEVICE = "cuda:1"  # HF teacher for inference
@@ -164,8 +165,8 @@ def load_checkpoint(checkpoint_path, student, optimizer, vllm_student=None):
 
 def main():
     # Load tokenizer
-    print(f"Loading tokenizer from {STUDENT}...")
-    tokenizer = AutoTokenizer.from_pretrained(STUDENT)
+    print(f"Loading tokenizer from {TEACHER}...")
+    tokenizer = AutoTokenizer.from_pretrained(TEACHER)
     tokenizer.padding_side = "left"  # Required for decoder-only models
     PAD_TOKEN_ID = tokenizer.pad_token_id or tokenizer.eos_token_id
 
@@ -287,7 +288,8 @@ def main():
     optimizer.zero_grad(set_to_none=True)
 
     # Create progress bar
-    pbar = tqdm(total=total_steps - start_step, desc="Training")
+    total_optimizer_steps = (steps_per_epoch * N_EPOCHS) // GRAD_ACCUM_STEPS
+    pbar = tqdm(total=total_optimizer_steps - start_step, desc="Training")
 
     # Set once to avoid per-step device switches
     torch.cuda.set_device(STUDENT_DEVICE)
