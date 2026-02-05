@@ -43,7 +43,6 @@ SYNC_EVERY_N_STEPS = 8
 
 RESUME_FROM = None  # or "checkpoints/step_1000"
 DEBUG_MODE = False
-PROFILE_STEPS = 0  # Set to 0 to disable profiling (uses lots of RAM)
 
 torch.manual_seed(1223)
 
@@ -266,8 +265,8 @@ def main():
     )
 
     print("Compiling models with torch.compile...")
-    student = torch.compile(student)
-    teacher = torch.compile(teacher)
+    student_compiled = torch.compile(student)
+    teacher_compiled = torch.compile(teacher)
 
     optimizer = AdamW4bit(student.parameters(), lr=LR)
 
@@ -330,23 +329,6 @@ def main():
     opt_step_start_time = None
     prefetch_wait_accum = 0.0
     prefetch_wait_count = 0
-
-    # Setup profiler
-    profiler = None
-    if PROFILE_STEPS > 0:
-        profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(
-                wait=1, warmup=1, active=PROFILE_STEPS, repeat=1
-            ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_logs"),
-            record_shapes=True,
-            with_stack=True,
-        )
-        profiler.start()
 
     for epoch in range(N_EPOCHS):
         # Convert to list for indexing (needed for prefetch lookahead)
@@ -416,7 +398,7 @@ def main():
             teacher_mask = attention_mask.to(TEACHER_DEVICE, non_blocking=True)
 
             with torch.inference_mode():
-                teacher_out = teacher(
+                teacher_out = teacher_compiled(
                     input_ids=teacher_input,
                     attention_mask=teacher_mask,
                 )
@@ -428,7 +410,7 @@ def main():
                 .detach()
             )
 
-            student_out = student(
+            student_out = student_compiled(
                 input_ids=student_input,
                 attention_mask=student_mask,
             )
@@ -489,11 +471,26 @@ def main():
                     "train/learning_rate": LR,
                     "train/global_step": global_step,
                     # Policy gradient diagnostics
-                    "train/mean_advantage": (advantage * loss_mask).sum().item() / loss_mask.sum().item(),
-                    "train/mean_ratio": (ratio * loss_mask).sum().item() / loss_mask.sum().item(),
-                    "train/mean_kl": ((old_logprobs_shifted - teacher_logprobs) * loss_mask).sum().item() / loss_mask.sum().item(),
-                    "train/ratio_clipped_frac": ((ratio > 1.2) | (ratio < 0.8)).float().mean().item(),
-                    "train/approx_policy_drift": (current_logprobs - old_logprobs_shifted).abs().mean().item(),
+                    "train/mean_advantage": (advantage * loss_mask).sum().item()
+                    / loss_mask.sum().item(),
+                    "train/mean_ratio": (ratio * loss_mask).sum().item()
+                    / loss_mask.sum().item(),
+                    "train/mean_kl": (
+                        (old_logprobs_shifted - teacher_logprobs) * loss_mask
+                    )
+                    .sum()
+                    .item()
+                    / loss_mask.sum().item(),
+                    "train/ratio_clipped_frac": ((ratio > 1.2) | (ratio < 0.8))
+                    .float()
+                    .mean()
+                    .item(),
+                    "train/approx_policy_drift": (
+                        current_logprobs - old_logprobs_shifted
+                    )
+                    .abs()
+                    .mean()
+                    .item(),
                 }
                 if opt_step_time is not None:
                     log_payload["train/optimizer_step_time_sec"] = opt_step_time
@@ -531,16 +528,6 @@ def main():
                         global_step,
                         hub_repo,
                     )
-
-            # Profiler step
-            if profiler is not None:
-                profiler.step()
-                if global_step >= PROFILE_STEPS + 2:  # wait + warmup + active
-                    profiler.stop()
-                    print(
-                        f"Profiler stopped. View with: tensorboard --logdir=./profiler_logs"
-                    )
-                    profiler = None
 
     pbar.close()
 
