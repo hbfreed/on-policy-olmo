@@ -17,6 +17,8 @@ import wandb
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 # DATASET = "allenai/Dolci-Think-RL-7B"
 DATASET = "allenai/Dolci-Instruct-RL"
@@ -75,6 +77,7 @@ def generate_rollouts(
     outputs = vllm_student.generate(
         prompts=token_prompts,
         sampling_params=sampling_params,
+        use_tqdm=False,
     )
 
     # Convert vLLM outputs to tensor: each RequestOutput has `outputs` list
@@ -249,8 +252,8 @@ def main():
     )
 
     print("Compiling models with torch.compile...")
-    student_compiled = torch.compile(student)
-    teacher_compiled = torch.compile(teacher)
+    student_compiled = torch.compile(student, dynamic=True)
+    teacher_compiled = torch.compile(teacher, dynamic=True)
 
     optimizer = AdamW4bit(student.parameters(), lr=LR)
 
