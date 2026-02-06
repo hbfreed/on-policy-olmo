@@ -1,4 +1,3 @@
-import io
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -120,17 +119,10 @@ def build_loss_mask(sequences, prompt_lens, pad_token_id):
     Returns: [batch, seq_len - 1] (shifted to match logprob indexing)
     """
     batch_size, seq_len = sequences.shape
-    mask = torch.ones(batch_size, seq_len, device=sequences.device)
-
-    # Mask prompt tokens per sequence
-    for i, pl in enumerate(prompt_lens):
-        mask[i, :pl] = 0.0
-
-    # Mask padding
+    positions = torch.arange(seq_len, device=sequences.device).unsqueeze(0)
+    prompt_lens_t = torch.tensor(prompt_lens, device=sequences.device).unsqueeze(1)
+    mask = (positions >= prompt_lens_t).float()
     mask[sequences == pad_token_id] = 0.0
-
-    # Shift to align with logprob indexing (logits[t] predicts token[t+1])
-    # We want to mask based on whether token[t+1] is a completion token
     return mask[:, 1:]
 
 
@@ -163,22 +155,14 @@ def sync_weights_to_vllm(hf_model, vllm_llm):
     Uses collective_rpc to update weights in V1 architecture.
     See: https://github.com/vllm-project/vllm/issues/5723
     """
-    # Serialize state dict to bytes (avoids pickle issues with numpy/tensors)
     hf_state_dict = {k: v.cpu() for k, v in hf_model.state_dict().items()}
-    buffer = io.BytesIO()
-    torch.save(hf_state_dict, buffer)
-    weights_bytes = buffer.getvalue()
+    weights = list(hf_state_dict.items())
 
-    # Define function to run on vLLM workers
-    def load_weights_on_worker(worker, serialized_weights):
-        buf = io.BytesIO(serialized_weights)
-        weights_dict = torch.load(buf, weights_only=True)
-        weights = list(weights_dict.items())
-        worker.model_runner.model.load_weights(weights=weights)
+    def load_weights_on_worker(worker, w):
+        worker.model_runner.model.load_weights(weights=w)
 
-    # Call on all workers via RPC
     method_bytes = cloudpickle.dumps(load_weights_on_worker)
-    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights_bytes,))
+    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights,))
 
 
 def timed_sync_weights_to_vllm(hf_model, vllm_llm):
@@ -323,6 +307,7 @@ def main():
     # Use a single-threaded executor to serialize all vLLM calls (generate/sync)
     vllm_executor = ThreadPoolExecutor(max_workers=1)
     checkpoint_executor = ThreadPoolExecutor(max_workers=1)
+    teacher_executor = ThreadPoolExecutor(max_workers=1)
     checkpoint_future = None
     sync_future = None
     last_sync_duration = None
@@ -397,24 +382,22 @@ def main():
             teacher_input = sequences.to(TEACHER_DEVICE, non_blocking=True)
             teacher_mask = attention_mask.to(TEACHER_DEVICE, non_blocking=True)
 
-            with torch.inference_mode():
-                teacher_out = teacher_compiled(
-                    input_ids=teacher_input,
-                    attention_mask=teacher_mask,
-                )
-                teacher_logits = teacher_out.logits
+            # Run teacher forward in background thread (separate GPU, no GIL contention
+            # during CUDA kernel execution) while student runs on main thread
+            def _teacher_forward(t_input, t_mask):
+                with torch.inference_mode():
+                    t_out = teacher_compiled(input_ids=t_input, attention_mask=t_mask)
+                return get_logprobs_at_tokens(t_out.logits, t_input).to(STUDENT_DEVICE).detach()
 
-            teacher_logprobs = (
-                get_logprobs_at_tokens(teacher_logits, teacher_input)
-                .to(STUDENT_DEVICE)
-                .detach()
-            )
+            teacher_future = teacher_executor.submit(_teacher_forward, teacher_input, teacher_mask)
 
             student_out = student_compiled(
                 input_ids=student_input,
                 attention_mask=student_mask,
             )
             current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input)
+
+            teacher_logprobs = teacher_future.result()
 
             loss_mask = build_loss_mask(student_input, prompt_len, PAD_TOKEN_ID)
 
@@ -454,43 +437,46 @@ def main():
                 opt_step_time = None
                 if opt_step_start_time is not None:
                     opt_step_time = time.time() - opt_step_start_time
-                avg_loss = accumulated_loss / GRAD_ACCUM_STEPS
+                avg_loss = accumulated_loss  # already averaged via scaled_loss
                 avg_prefetch_wait = (
                     prefetch_wait_accum / prefetch_wait_count
                     if prefetch_wait_count > 0
                     else 0.0
                 )
 
-                # Log metrics
+                # Log metrics — batch all GPU->CPU transfers into one sync
+                mask_sum = loss_mask.sum()
+                metrics_tensor = torch.stack([
+                    grad_norm,
+                    (advantage * loss_mask).sum() / mask_sum,
+                    (ratio * loss_mask).sum() / mask_sum,
+                    ((old_logprobs_shifted - teacher_logprobs) * loss_mask).sum() / mask_sum,
+                    ((ratio > 1.2) | (ratio < 0.8)).float().mean(),
+                    (current_logprobs - old_logprobs_shifted).abs().mean(),
+                ])
+                (
+                    grad_norm_val,
+                    mean_advantage,
+                    mean_ratio,
+                    mean_kl,
+                    ratio_clipped_frac,
+                    approx_policy_drift,
+                ) = metrics_tensor.tolist()
+
                 log_payload = {
                     "train/loss": avg_loss,
-                    "train/grad_norm": grad_norm.item(),
+                    "train/grad_norm": grad_norm_val,
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/step_time_sec": step_time,
                     "train/prefetch_wait_sec": avg_prefetch_wait,
                     "train/learning_rate": LR,
                     "train/global_step": global_step,
                     # Policy gradient diagnostics
-                    "train/mean_advantage": (advantage * loss_mask).sum().item()
-                    / loss_mask.sum().item(),
-                    "train/mean_ratio": (ratio * loss_mask).sum().item()
-                    / loss_mask.sum().item(),
-                    "train/mean_kl": (
-                        (old_logprobs_shifted - teacher_logprobs) * loss_mask
-                    )
-                    .sum()
-                    .item()
-                    / loss_mask.sum().item(),
-                    "train/ratio_clipped_frac": ((ratio > 1.2) | (ratio < 0.8))
-                    .float()
-                    .mean()
-                    .item(),
-                    "train/approx_policy_drift": (
-                        current_logprobs - old_logprobs_shifted
-                    )
-                    .abs()
-                    .mean()
-                    .item(),
+                    "train/mean_advantage": mean_advantage,
+                    "train/mean_ratio": mean_ratio,
+                    "train/mean_kl": mean_kl,
+                    "train/ratio_clipped_frac": ratio_clipped_frac,
+                    "train/approx_policy_drift": approx_policy_drift,
                 }
                 if opt_step_time is not None:
                     log_payload["train/optimizer_step_time_sec"] = opt_step_time
@@ -539,6 +525,7 @@ def main():
 
     vllm_executor.shutdown(wait=True)
     checkpoint_executor.shutdown(wait=True)
+    teacher_executor.shutdown(wait=True)
 
     # Final save (synchronous - we're done anyway)
     hub_repo = None if DEBUG_MODE else HUB_REPO
