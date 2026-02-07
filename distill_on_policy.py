@@ -2,6 +2,7 @@ import io
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 import bitsandbytes as bnb
 import cloudpickle
@@ -79,6 +80,19 @@ def get_sync_interval(step, mean_ratio, approx_drift, current_interval):
 def get_logprobs_at_tokens(logits, tokens):
     log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
     return log_probs.gather(-1, tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
+
+
+def run_teacher_pipeline(teacher, sequences, attention_mask, group_size,
+                         device, student_device, queue):
+    """Producer: compute teacher logprobs in chunks, push to queue."""
+    for i in range(0, len(sequences), group_size):
+        chunk_seq = sequences[i:i + group_size].to(device, non_blocking=True)
+        chunk_mask = attention_mask[i:i + group_size].to(device, non_blocking=True)
+        with torch.inference_mode():
+            t_out = teacher(input_ids=chunk_seq, attention_mask=chunk_mask)
+        logprobs = get_logprobs_at_tokens(t_out.logits, chunk_seq)
+        queue.put(logprobs.to(student_device).detach())
+    queue.put(None)  # sentinel
 
 
 def generate_rollouts(
@@ -424,6 +438,15 @@ def main():
 
             total_generated_tokens = 0
 
+            # Producer-consumer pipeline: teacher is faster (no backward, no grad
+            # checkpointing) so it races ahead by 2-3 chunks, keeping both GPUs busy.
+            # maxsize=4 bounds memory so teacher doesn't cache too many logprobs.
+            teacher_queue = Queue(maxsize=4)
+            teacher_thread = teacher_executor.submit(
+                run_teacher_pipeline, teacher_compiled, sequences, attention_mask,
+                group_size, TEACHER_DEVICE, STUDENT_DEVICE, teacher_queue
+            )
+
             # Inner loop: micro-batches over pre-generated sequences
             for micro_idx in range(GRAD_ACCUM_STEPS):
                 start = micro_idx * group_size
@@ -436,23 +459,6 @@ def main():
                 # Move inputs once
                 student_input = mb_seq.to(STUDENT_DEVICE, non_blocking=True)
                 student_mask = mb_mask.to(STUDENT_DEVICE, non_blocking=True)
-                teacher_input = mb_seq.to(TEACHER_DEVICE, non_blocking=True)
-                teacher_mask = mb_mask.to(TEACHER_DEVICE, non_blocking=True)
-
-                # Run teacher forward in background thread (separate GPU, no GIL contention
-                # during CUDA kernel execution) while student runs on main thread
-                def _teacher_forward(t_input, t_mask):
-                    with torch.inference_mode():
-                        t_out = teacher_compiled(input_ids=t_input, attention_mask=t_mask)
-                    return (
-                        get_logprobs_at_tokens(t_out.logits, t_input)
-                        .to(STUDENT_DEVICE)
-                        .detach()
-                    )
-
-                teacher_future = teacher_executor.submit(
-                    _teacher_forward, teacher_input, teacher_mask
-                )
 
                 student_out = student_compiled(
                     input_ids=student_input,
@@ -460,7 +466,7 @@ def main():
                 )
                 current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input)
 
-                teacher_logprobs = teacher_future.result()
+                teacher_logprobs = teacher_queue.get()  # blocks only if teacher behind
 
                 loss_mask = build_loss_mask(student_input, mb_plens, PAD_TOKEN_ID)
 
@@ -503,6 +509,10 @@ def main():
                 scaled_loss = masked_loss / GRAD_ACCUM_STEPS
                 scaled_loss.backward()
                 accumulated_loss += scaled_loss.item()
+
+            # Drain sentinel and propagate any teacher exception
+            assert teacher_queue.get() is None
+            teacher_thread.result()
 
             # --- Optimizer step (after all micro-batches) ---
             # Verify gradients exist (first few steps, before zero_grad)
