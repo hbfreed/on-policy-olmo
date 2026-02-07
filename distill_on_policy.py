@@ -1,13 +1,14 @@
+import io
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import bitsandbytes as bnb
 import cloudpickle
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
-from torchao.optim import AdamW4bit
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -34,18 +35,45 @@ STUDENT_DEVICE = "cuda:2"  # HF student for training
 TEACHER_DEVICE = "cuda:1"  # HF teacher for inference
 VLLM_DEVICE = "cuda:0"  # vLLM student for fast generation (vLLM uses first visible GPU)
 
-BATCH_SIZE = 3
+BATCH_SIZE = 1
 N_EPOCHS = 1
-GROUP_SIZE = 2  # number of rollouts per prompt
-GRAD_ACCUM_STEPS = 4
-MAX_CONTEXT_LENGTH = 1024  # Reduced to fit in GPU memory
-LR = 1e-4
-SYNC_EVERY_N_STEPS = 8
+GROUP_SIZE = 3  # number of rollouts per prompt
+GRAD_ACCUM_STEPS = 64
+MAX_CONTEXT_LENGTH = 2048
+LR = 1e-6
+SYNC_EVERY_N_STEPS = 1
+SYNC_MIN = 1
+SYNC_MAX = 16
 
 RESUME_FROM = None  # or "checkpoints/step_1000"
 DEBUG_MODE = False
+N_SAMPLE_PROMPTS = 4
+SAMPLE_EVERY_N_STEPS = 200
+
+steps_since_decrease = 0
 
 torch.manual_seed(1223)
+
+
+def get_sync_interval(step, mean_ratio, approx_drift, current_interval):
+    global steps_since_decrease
+
+    if step < 50:
+        return 1
+
+    # Danger — policy drifted too far, importance sampling unreliable
+    if abs(mean_ratio - 1.0) > 0.2 or approx_drift > 0.25:
+        steps_since_decrease = 0
+        return max(SYNC_MIN, current_interval // 2)
+
+    steps_since_decrease += 1
+
+    # Comfortable for a while — try pushing
+    if (abs(mean_ratio - 1.0) < 0.05 and approx_drift < 0.08
+            and steps_since_decrease > 20):
+        return min(SYNC_MAX, current_interval + 1)
+
+    return current_interval
 
 
 def get_logprobs_at_tokens(logits, tokens):
@@ -54,13 +82,9 @@ def get_logprobs_at_tokens(logits, tokens):
 
 
 def generate_rollouts(
-    vllm_student, batch, pad_token_id, group_size=1, max_context_length=4096
+    vllm_student, prompts, pad_token_id, group_size=1, max_context_length=4096
 ):
     """Generate rollouts from student model using vLLM, returning sequences and prompt length."""
-    prompts = batch["input_ids_prompt"]
-    if not isinstance(prompts[0], list):
-        prompts = [prompts]
-
     prompt_lens = [len(p) for p in prompts]
     max_prompt_len = max(prompt_lens)
     max_new_tokens = max_context_length - max_prompt_len
@@ -129,6 +153,33 @@ def build_loss_mask(sequences, prompt_lens, pad_token_id):
     return mask[:, 1:]
 
 
+def generate_samples(vllm_student, eval_prompts, tokenizer, max_context_length=4096):
+    """Generate completions for eval prompts and return a wandb.Table."""
+    prompt_lens = [len(p) for p in eval_prompts]
+    max_prompt_len = max(prompt_lens)
+    sampling_params = SamplingParams(
+        temperature=0.7,
+        max_tokens=max_context_length - max_prompt_len,
+        n=1,
+    )
+    token_prompts = [{"prompt_token_ids": p} for p in eval_prompts]
+    outputs = vllm_student.generate(
+        prompts=token_prompts,
+        sampling_params=sampling_params,
+        use_tqdm=False,
+    )
+    table = wandb.Table(columns=["prompt", "completion"])
+    for req_output in outputs:
+        prompt_text = tokenizer.decode(
+            req_output.prompt_token_ids, skip_special_tokens=True
+        )
+        completion_text = tokenizer.decode(
+            req_output.outputs[0].token_ids, skip_special_tokens=True
+        )
+        table.add_data(prompt_text, completion_text)
+    return table
+
+
 def save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo=None):
     """Save checkpoint to disk and optionally push to hub."""
     checkpoint_dir = f"checkpoints/step_{global_step}"
@@ -159,13 +210,18 @@ def sync_weights_to_vllm(hf_model, vllm_llm):
     See: https://github.com/vllm-project/vllm/issues/5723
     """
     hf_state_dict = {k: v.cpu() for k, v in hf_model.state_dict().items()}
-    weights = list(hf_state_dict.items())
+    buffer = io.BytesIO()
+    torch.save(hf_state_dict, buffer)
+    weights_bytes = buffer.getvalue()
 
-    def load_weights_on_worker(worker, w):
-        worker.model_runner.model.load_weights(weights=w)
+    def load_weights_on_worker(worker, serialized_weights):
+        buf = io.BytesIO(serialized_weights)
+        weights_dict = torch.load(buf, weights_only=True)
+        weights = list(weights_dict.items())
+        worker.model_runner.model.load_weights(weights=weights)
 
     method_bytes = cloudpickle.dumps(load_weights_on_worker)
-    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights,))
+    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights_bytes,))
 
 
 def timed_sync_weights_to_vllm(hf_model, vllm_llm):
@@ -210,11 +266,17 @@ def main():
         dataset = dataset.select(range(min(32, len(dataset))))
         print(f"DEBUG MODE: Using {len(dataset)} samples")
 
+    # Fixed eval prompts for tracking generation quality over training
+    eval_prompts = [
+        dataset[i]["input_ids_prompt"]
+        for i in range(min(N_SAMPLE_PROMPTS, len(dataset)))
+    ]
+
     batch_size = BATCH_SIZE
     group_size = GROUP_SIZE
     max_context = MAX_CONTEXT_LENGTH
 
-    steps_per_epoch = len(dataset) // batch_size
+    steps_per_epoch = len(dataset) // (batch_size * GRAD_ACCUM_STEPS)
     total_steps = steps_per_epoch * N_EPOCHS
     save_every = max(1, min(500, int(total_steps * 0.02)))
 
@@ -251,11 +313,12 @@ def main():
         dtype="bfloat16",
     )
 
-    print("Compiling models with torch.compile...")
-    student_compiled = torch.compile(student, dynamic=True)
-    teacher_compiled = torch.compile(teacher, dynamic=True)
+    student.gradient_checkpointing_enable()
 
-    optimizer = AdamW4bit(student.parameters(), lr=LR)
+    student_compiled = student
+    teacher_compiled = teacher
+
+    optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=LR)
 
     start_step = 0
     if RESUME_FROM:
@@ -293,236 +356,270 @@ def main():
         resume="allow",
     )
 
+    # Baseline generation samples before any training
+    baseline_table = generate_samples(vllm_student, eval_prompts, tokenizer, max_context)
+    wandb.log({"eval/samples": baseline_table}, step=0)
+
     # Training loop
     global_step = start_step
     accumulated_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
 
     # Create progress bar
-    total_optimizer_steps = (steps_per_epoch * N_EPOCHS) // GRAD_ACCUM_STEPS
+    total_optimizer_steps = steps_per_epoch * N_EPOCHS
     pbar = tqdm(total=total_optimizer_steps - start_step, desc="Training")
 
     # Set once to avoid per-step device switches
     torch.cuda.set_device(STUDENT_DEVICE)
 
-    # Async prefetch: generate batch N+1 while training on batch N
-    # This overlaps vLLM generation (GPU 0) with HF training (GPU 1+2)
     # Use a single-threaded executor to serialize all vLLM calls (generate/sync)
     vllm_executor = ThreadPoolExecutor(max_workers=1)
     checkpoint_executor = ThreadPoolExecutor(max_workers=1)
     teacher_executor = ThreadPoolExecutor(max_workers=1)
     checkpoint_future = None
     sync_future = None
+    sample_future = None
     last_sync_duration = None
-    opt_step_start_time = None
-    prefetch_wait_accum = 0.0
-    prefetch_wait_count = 0
+    sync_interval = SYNC_EVERY_N_STEPS
 
     for epoch in range(N_EPOCHS):
-        # Convert to list for indexing (needed for prefetch lookahead)
         all_batches = list(dataset.iter(batch_size=batch_size))
-        prefetch_future = None
 
-        for batch_idx, batch in enumerate(all_batches):
-            # Skip batches if resuming
-            current_step = epoch * steps_per_epoch + batch_idx
+        for opt_step_idx in range(steps_per_epoch):
+            # Skip if resuming
+            current_step = epoch * steps_per_epoch + opt_step_idx
             if current_step < start_step:
                 continue
 
-            if sync_future is not None and sync_future.done():
+            # Ensure any in-flight weight sync is done before generating
+            if sync_future is not None:
                 last_sync_duration = sync_future.result()
                 sync_future = None
 
-            if batch_idx % GRAD_ACCUM_STEPS == 0:
-                opt_step_start_time = time.time()
+            if sample_future is not None and sample_future.done():
+                wandb.log({"eval/samples": sample_future.result()})
+                sample_future = None
 
-            step_start_time = time.time()
+            opt_step_start_time = time.time()
 
-            # Get sequences: either from prefetch or generate synchronously (first batch)
-            if prefetch_future is not None:
-                prefetch_wait_start = time.time()
-                sequences, prompt_len, old_student_logprobs, attention_mask = (
-                    prefetch_future.result()
+            # Collect GRAD_ACCUM_STEPS prompts and generate all rollouts at once
+            chunk_start = opt_step_idx * GRAD_ACCUM_STEPS
+            chunk_end = chunk_start + GRAD_ACCUM_STEPS
+            prompts = [all_batches[i]["input_ids_prompt"] for i in range(chunk_start, chunk_end)]
+            # Each prompt comes as a list of token ids from the dataset;
+            # with batch_size=1, iter yields single-element lists — unwrap them
+            prompts = [p[0] if isinstance(p, list) and isinstance(p[0], list) else p for p in prompts]
+
+            gen_start_time = time.time()
+            sequences, prompt_lens, old_student_logprobs, attention_mask = (
+                generate_rollouts(
+                    vllm_student, prompts, PAD_TOKEN_ID, group_size, max_context
                 )
-                prefetch_wait_sec = time.time() - prefetch_wait_start
-                gen_time = time.time() - prefetch_start_time
-            else:
-                gen_start_time = time.time()
-                gen_future = vllm_executor.submit(
-                    generate_rollouts,
-                    vllm_student,
-                    batch,
-                    PAD_TOKEN_ID,
-                    group_size,
-                    max_context,
-                )
-                sequences, prompt_len, old_student_logprobs, attention_mask = (
-                    gen_future.result()
-                )
-                gen_time = time.time() - gen_start_time
-                prefetch_wait_sec = 0.0
-
-            # Start prefetching next batch (runs in background during training)
-            if batch_idx + 1 < len(all_batches):
-                next_batch = all_batches[batch_idx + 1]
-                prefetch_start_time = time.time()
-                prefetch_future = vllm_executor.submit(
-                    generate_rollouts,
-                    vllm_student,
-                    next_batch,
-                    PAD_TOKEN_ID,
-                    group_size,
-                    max_context,
-                )
-            else:
-                prefetch_future = None
-            prefetch_wait_accum += prefetch_wait_sec
-            prefetch_wait_count += 1
-
-            # Move inputs once
-            student_input = sequences.to(STUDENT_DEVICE, non_blocking=True)
-            student_mask = attention_mask.to(STUDENT_DEVICE, non_blocking=True)
-            teacher_input = sequences.to(TEACHER_DEVICE, non_blocking=True)
-            teacher_mask = attention_mask.to(TEACHER_DEVICE, non_blocking=True)
-
-            # Run teacher forward in background thread (separate GPU, no GIL contention
-            # during CUDA kernel execution) while student runs on main thread
-            def _teacher_forward(t_input, t_mask):
-                with torch.inference_mode():
-                    t_out = teacher_compiled(input_ids=t_input, attention_mask=t_mask)
-                return get_logprobs_at_tokens(t_out.logits, t_input).to(STUDENT_DEVICE).detach()
-
-            teacher_future = teacher_executor.submit(_teacher_forward, teacher_input, teacher_mask)
-
-            student_out = student_compiled(
-                input_ids=student_input,
-                attention_mask=student_mask,
             )
-            current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input)
+            gen_time = time.time() - gen_start_time
 
-            teacher_logprobs = teacher_future.result()
+            # Print a decoded rollout to check if training data is coherent
+            if opt_step_idx < 2:
+                print(f"[opt_step {opt_step_idx}] Rollout sample: {tokenizer.decode(sequences[0].tolist()[:200])}")
 
-            loss_mask = build_loss_mask(student_input, prompt_len, PAD_TOKEN_ID)
+            total_generated_tokens = 0
 
-            num_generated_tokens = loss_mask.sum().item()
-            tokens_per_sec = num_generated_tokens / gen_time if gen_time > 0 else 0
+            # Inner loop: micro-batches over pre-generated sequences
+            for micro_idx in range(GRAD_ACCUM_STEPS):
+                start = micro_idx * group_size
+                end = start + group_size
+                mb_seq = sequences[start:end]
+                mb_plens = prompt_lens[start:end]
+                mb_old_lp = old_student_logprobs[start:end]
+                mb_mask = attention_mask[start:end]
 
-            old_logprobs_shifted = old_student_logprobs[:, 1:].to(STUDENT_DEVICE)
-            advantage = -(old_logprobs_shifted - teacher_logprobs)
+                # Move inputs once
+                student_input = mb_seq.to(STUDENT_DEVICE, non_blocking=True)
+                student_mask = mb_mask.to(STUDENT_DEVICE, non_blocking=True)
+                teacher_input = mb_seq.to(TEACHER_DEVICE, non_blocking=True)
+                teacher_mask = mb_mask.to(TEACHER_DEVICE, non_blocking=True)
 
-            ratio = torch.exp(current_logprobs - old_logprobs_shifted)
-            per_token_loss = -(ratio * advantage.detach())
-            masked_loss = (per_token_loss * loss_mask).sum() / loss_mask.sum()
-
-            # Scale loss for gradient accumulation
-            scaled_loss = masked_loss / GRAD_ACCUM_STEPS
-            scaled_loss.backward()
-            accumulated_loss += scaled_loss.item()
-
-            # Optimizer step every GRAD_ACCUM_STEPS
-            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
-                # Verify gradients exist (first few steps, before zero_grad)
-                if global_step < 3:
-                    has_grads = any(
-                        p.grad is not None
-                        for p in student.parameters()
-                        if p.requires_grad
+                # Run teacher forward in background thread (separate GPU, no GIL contention
+                # during CUDA kernel execution) while student runs on main thread
+                def _teacher_forward(t_input, t_mask):
+                    with torch.inference_mode():
+                        t_out = teacher_compiled(input_ids=t_input, attention_mask=t_mask)
+                    return (
+                        get_logprobs_at_tokens(t_out.logits, t_input)
+                        .to(STUDENT_DEVICE)
+                        .detach()
                     )
-                    print(f"Step {global_step + 1}: gradients exist = {has_grads}")
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    student.parameters(), max_norm=1.0
-                )
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-                step_time = time.time() - step_start_time
-                opt_step_time = None
-                if opt_step_start_time is not None:
-                    opt_step_time = time.time() - opt_step_start_time
-                avg_loss = accumulated_loss  # already averaged via scaled_loss
-                avg_prefetch_wait = (
-                    prefetch_wait_accum / prefetch_wait_count
-                    if prefetch_wait_count > 0
-                    else 0.0
+                teacher_future = teacher_executor.submit(
+                    _teacher_forward, teacher_input, teacher_mask
                 )
 
-                # Log metrics — batch all GPU->CPU transfers into one sync
-                mask_sum = loss_mask.sum()
-                metrics_tensor = torch.stack([
+                student_out = student_compiled(
+                    input_ids=student_input,
+                    attention_mask=student_mask,
+                )
+                current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input)
+
+                teacher_logprobs = teacher_future.result()
+
+                loss_mask = build_loss_mask(student_input, mb_plens, PAD_TOKEN_ID)
+
+                # Gradient chain diagnostics (first 3 steps only)
+                if global_step < 3 and micro_idx == 0:
+                    print(f"--- Gradient diagnostics (step {global_step}) ---")
+                    print(f"logits.grad_fn: {student_out.logits.grad_fn}")
+                    print(f"logits.requires_grad: {student_out.logits.requires_grad}")
+                    print(f"current_logprobs.grad_fn: {current_logprobs.grad_fn}")
+                    print(f"loss_mask sum: {loss_mask.sum().item()}")
+
+                seq_lens = mb_mask.to(STUDENT_DEVICE).sum(dim=1)
+                prompt_lens_t = torch.tensor(mb_plens, device=STUDENT_DEVICE)
+                avg_gen_len = (seq_lens - prompt_lens_t).float().mean()
+
+                num_generated_tokens = loss_mask.sum().item()
+                total_generated_tokens += num_generated_tokens
+
+                old_logprobs_shifted = mb_old_lp[:, 1:].to(STUDENT_DEVICE)
+                advantage = -(old_logprobs_shifted - teacher_logprobs)
+
+                ratio = torch.exp(current_logprobs - old_logprobs_shifted)
+                eps = 0.2
+                ratio_clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
+                loss_unclipped = -ratio * advantage.detach()
+                loss_clipped = -ratio_clipped * advantage.detach()
+                per_token_loss = torch.max(loss_unclipped, loss_clipped)  # pessimistic bound
+                masked_loss = (per_token_loss * loss_mask).sum() / loss_mask.sum()
+
+                # Gradient chain diagnostics continued
+                if global_step < 3 and micro_idx == 0:
+                    ms = max(loss_mask.sum().item(), 1)
+                    print(f"advantage abs mean: {(advantage * loss_mask).abs().sum().item() / ms:.6f}")
+                    print(f"ratio mean (should be ~1): {(ratio * loss_mask).sum().item() / ms:.6f}")
+                    print(f"masked_loss: {masked_loss.item():.6f}")
+                    print(f"masked_loss.grad_fn: {masked_loss.grad_fn}")
+                    print("---")
+
+                # Scale loss for gradient accumulation
+                scaled_loss = masked_loss / GRAD_ACCUM_STEPS
+                scaled_loss.backward()
+                accumulated_loss += scaled_loss.item()
+
+            # --- Optimizer step (after all micro-batches) ---
+            # Verify gradients exist (first few steps, before zero_grad)
+            if global_step < 3:
+                has_grads = any(
+                    p.grad is not None
+                    for p in student.parameters()
+                    if p.requires_grad
+                )
+                print(f"Step {global_step + 1}: gradients exist = {has_grads}")
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                student.parameters(), max_norm=1.0
+            )
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            opt_step_time = time.time() - opt_step_start_time
+            avg_loss = accumulated_loss  # already averaged via scaled_loss
+
+            tokens_per_sec = total_generated_tokens / gen_time if gen_time > 0 else 0
+
+            # Log metrics — batch all GPU->CPU transfers into one sync
+            # (uses values from last micro-batch, same as before)
+            mask_sum = loss_mask.sum()
+            metrics_tensor = torch.stack(
+                [
                     grad_norm,
                     (advantage * loss_mask).sum() / mask_sum,
                     (ratio * loss_mask).sum() / mask_sum,
-                    ((old_logprobs_shifted - teacher_logprobs) * loss_mask).sum() / mask_sum,
-                    ((ratio > 1.2) | (ratio < 0.8)).float().mean(),
-                    (current_logprobs - old_logprobs_shifted).abs().mean(),
-                ])
-                (
-                    grad_norm_val,
-                    mean_advantage,
-                    mean_ratio,
-                    mean_kl,
-                    ratio_clipped_frac,
-                    approx_policy_drift,
-                ) = metrics_tensor.tolist()
+                    ((old_logprobs_shifted - teacher_logprobs) * loss_mask).sum()
+                    / mask_sum,
+                    ((ratio > 1.2) | (ratio < 0.8)).float().sum() / mask_sum,
+                    (
+                        (current_logprobs - old_logprobs_shifted).abs() * loss_mask
+                    ).sum()
+                    / mask_sum,
+                ]
+            )
+            (
+                grad_norm_val,
+                mean_advantage,
+                mean_ratio,
+                mean_kl,
+                ratio_clipped_frac,
+                approx_policy_drift,
+            ) = metrics_tensor.tolist()
 
-                log_payload = {
-                    "train/loss": avg_loss,
-                    "train/grad_norm": grad_norm_val,
-                    "train/tokens_per_sec": tokens_per_sec,
-                    "train/step_time_sec": step_time,
-                    "train/prefetch_wait_sec": avg_prefetch_wait,
-                    "train/learning_rate": LR,
-                    "train/global_step": global_step,
-                    # Policy gradient diagnostics
-                    "train/mean_advantage": mean_advantage,
-                    "train/mean_ratio": mean_ratio,
-                    "train/mean_kl": mean_kl,
-                    "train/ratio_clipped_frac": ratio_clipped_frac,
-                    "train/approx_policy_drift": approx_policy_drift,
-                }
-                if opt_step_time is not None:
-                    log_payload["train/optimizer_step_time_sec"] = opt_step_time
-                if last_sync_duration is not None:
-                    log_payload["train/sync_duration_sec"] = last_sync_duration
-                    last_sync_duration = None
-                log_payload["train/sync_every_n_steps"] = SYNC_EVERY_N_STEPS
-                wandb.log(log_payload)
+            log_payload = {
+                "train/loss": avg_loss,
+                "train/grad_norm": grad_norm_val,
+                "train/tokens_per_sec": tokens_per_sec,
+                "train/gen_time_sec": gen_time,
+                "train/optimizer_step_time_sec": opt_step_time,
+                "train/learning_rate": LR,
+                "train/global_step": global_step,
+                # Policy gradient diagnostics
+                "train/mean_advantage": mean_advantage,
+                "train/mean_ratio": mean_ratio,
+                "train/mean_kl": mean_kl,
+                "train/ratio_clipped_frac": ratio_clipped_frac,
+                "train/approx_policy_drift": approx_policy_drift,
+                "train/avg_gen_length": avg_gen_len.item(),
+            }
+            if last_sync_duration is not None:
+                log_payload["train/sync_duration_sec"] = last_sync_duration
+                last_sync_duration = None
+            sync_interval = get_sync_interval(
+                global_step, mean_ratio, approx_policy_drift, sync_interval
+            )
+            log_payload["train/sync_every_n_steps"] = sync_interval
+            wandb.log(log_payload)
 
-                accumulated_loss = 0.0
-                prefetch_wait_accum = 0.0
-                prefetch_wait_count = 0
-                global_step += 1
-                pbar.update(1)
+            accumulated_loss = 0.0
+            global_step += 1
+            pbar.update(1)
 
-                # Sync updated weights to vLLM for on-policy generation
-                if global_step % SYNC_EVERY_N_STEPS == 0:
-                    if sync_future is None or sync_future.done():
-                        sync_future = vllm_executor.submit(
-                            timed_sync_weights_to_vllm, student, vllm_student
-                        )
-
-                # Save checkpoint (async - don't block training)
-                # Skip hub upload in debug mode
-                hub_repo = None if DEBUG_MODE else HUB_REPO
-                if global_step % save_every == 0:
-                    # Wait for previous upload to finish before starting new one
-                    if checkpoint_future is not None:
-                        checkpoint_future.result()
-                    checkpoint_future = checkpoint_executor.submit(
-                        save_checkpoint,
-                        student,
-                        tokenizer,
-                        optimizer,
-                        global_step,
-                        hub_repo,
+            # Sync updated weights to vLLM for on-policy generation
+            if global_step % sync_interval == 0:
+                if sync_future is None or sync_future.done():
+                    sync_future = vllm_executor.submit(
+                        timed_sync_weights_to_vllm, student, vllm_student
                     )
+
+            # Log generation quality samples (non-blocking)
+            if global_step % SAMPLE_EVERY_N_STEPS == 0 and sample_future is None:
+                sample_future = vllm_executor.submit(
+                    generate_samples,
+                    vllm_student,
+                    eval_prompts,
+                    tokenizer,
+                    max_context,
+                )
+
+            # Save checkpoint (async - don't block training)
+            # Skip hub upload in debug mode
+            hub_repo = None if DEBUG_MODE else HUB_REPO
+            if global_step % save_every == 0:
+                # Wait for previous upload to finish before starting new one
+                if checkpoint_future is not None:
+                    checkpoint_future.result()
+                checkpoint_future = checkpoint_executor.submit(
+                    save_checkpoint,
+                    student,
+                    tokenizer,
+                    optimizer,
+                    global_step,
+                    hub_repo,
+                )
 
     pbar.close()
 
-    # Wait for any pending sync/checkpoint
+    # Wait for any pending sync/checkpoint/samples
     if sync_future is not None:
         sync_future.result()
+    if sample_future is not None:
+        wandb.log({"eval/samples": sample_future.result()})
     if checkpoint_future is not None:
         checkpoint_future.result()
 
