@@ -26,7 +26,7 @@ torch._dynamo.config.allow_unspec_int_on_nn_module = True
 DATASET = "allenai/Dolci-Instruct-RL"
 TEACHER = "allenai/Olmo-3-7B-Instruct"
 STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
-HUB_REPO = "hbfreed/Olmo-2-1B-Distilled"
+HUB_REPO = None  # "hbfreed/Olmo-2-1B-Distilled"
 WANDB_PROJECT = "olmo-2-1b-on-policy-distillation"
 RUN_NAME = (
     "instruct-student-instruct-teacher"  # set to a string to override auto naming
@@ -38,10 +38,10 @@ VLLM_DEVICE = "cuda:0"  # vLLM student for fast generation (vLLM uses first visi
 
 BATCH_SIZE = 1
 N_EPOCHS = 1
-GROUP_SIZE = 3  # number of rollouts per prompt
+GROUP_SIZE = 2  # number of rollouts per prompt
 GRAD_ACCUM_STEPS = 64
 MAX_CONTEXT_LENGTH = 2048
-LR = 1e-6
+LR = 1e-7
 SYNC_EVERY_N_STEPS = 1
 SYNC_MIN = 1
 SYNC_MAX = 16
@@ -210,8 +210,13 @@ def save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo=None):
 
     if hub_repo:
         try:
-            student.push_to_hub(hub_repo, commit_message=f"Step {global_step}")
-            tokenizer.push_to_hub(hub_repo, commit_message=f"Step {global_step}")
+            from huggingface_hub import HfApi
+            HfApi().upload_folder(
+                folder_path=checkpoint_dir,
+                repo_id=hub_repo,
+                commit_message=f"Step {global_step}",
+                ignore_patterns=["training_state.pt"],
+            )
             print(f"Pushed checkpoint to {hub_repo}")
         except Exception as e:
             print(f"Failed to push to hub: {e}")
@@ -405,12 +410,13 @@ def main():
             if current_step < start_step:
                 continue
 
-            # Ensure any in-flight weight sync is done before generating
+            # Ensure any in-flight vLLM work is done before generating —
+            # vLLM is not thread-safe for concurrent generate calls
             if sync_future is not None:
                 last_sync_duration = sync_future.result()
                 sync_future = None
 
-            if sample_future is not None and sample_future.done():
+            if sample_future is not None:
                 wandb.log({"eval/samples": sample_future.result()})
                 sample_future = None
 
