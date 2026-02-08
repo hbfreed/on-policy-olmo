@@ -16,4 +16,5 @@ dependencies = [
     "hf-transfer>=0.1.9",
     "vllm>=0.15.0",
     "openbench>=0.5.3",
+    "bitsandbytes>=0.49.1",
 ]

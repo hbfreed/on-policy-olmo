@@ -77,7 +77,9 @@ def get_sync_interval(step, mean_ratio, approx_drift, current_interval):
     return current_interval
 
 
-def get_logprobs_at_tokens(logits, tokens):
+def get_logprobs_at_tokens(logits, tokens, vocab_size=None):
+    if vocab_size is not None:
+        logits = logits[:, :, :vocab_size]
     log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
     return log_probs.gather(-1, tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
 
@@ -318,9 +320,10 @@ def main():
     ).to(TEACHER_DEVICE)
     teacher.eval()
 
-    # Resize teacher vocab to match student (100352 vs 100278)
-    # This adds 74 new tokens initialized randomly (won't be used in practice)
-    teacher.resize_token_embeddings(100352)
+    # Student has padded vocab (100352) vs teacher (100278).
+    # Truncate student logits to teacher vocab size before log_softmax
+    # so both models normalize over the same vocabulary.
+    SHARED_VOCAB_SIZE = teacher.config.vocab_size
 
     # Initialize vLLM for fast generation on separate GPU
     # skip_tokenizer_init=True since we input token IDs directly
@@ -470,7 +473,7 @@ def main():
                     input_ids=student_input,
                     attention_mask=student_mask,
                 )
-                current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input)
+                current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input, SHARED_VOCAB_SIZE)
 
                 teacher_logprobs = teacher_queue.get()  # blocks only if teacher behind
 
@@ -495,11 +498,7 @@ def main():
                 advantage = -(old_logprobs_shifted - teacher_logprobs)
 
                 ratio = torch.exp(current_logprobs - old_logprobs_shifted)
-                eps = 0.2
-                ratio_clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
-                loss_unclipped = -ratio * advantage.detach()
-                loss_clipped = -ratio_clipped * advantage.detach()
-                per_token_loss = torch.max(loss_unclipped, loss_clipped)  # pessimistic bound
+                per_token_loss = -ratio * advantage.detach()
                 masked_loss = (per_token_loss * loss_mask).sum() / loss_mask.sum()
 
                 # Gradient chain diagnostics continued
@@ -531,7 +530,7 @@ def main():
                 print(f"Step {global_step + 1}: gradients exist = {has_grads}")
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                student.parameters(), max_norm=1.0
+                student.parameters(), max_norm=50.0
             )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
