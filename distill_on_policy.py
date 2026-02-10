@@ -38,10 +38,11 @@ VLLM_DEVICE = "cuda:0"  # vLLM student for fast generation (vLLM uses first visi
 
 BATCH_SIZE = 1
 N_EPOCHS = 1
-GROUP_SIZE = 2  # number of rollouts per prompt
+GROUP_SIZE = 4  # number of rollouts per prompt
+MICRO_BATCH_SIZE = 2  # sequences per student/teacher forward pass (decoupled from group_size)
 GRAD_ACCUM_STEPS = 64
 MAX_CONTEXT_LENGTH = 2048
-LR = 1e-4
+LR = 5e-5
 SYNC_EVERY_N_STEPS = 2
 SYNC_MIN = 2 
 SYNC_MAX = 16
@@ -84,12 +85,12 @@ def get_logprobs_at_tokens(logits, tokens, vocab_size=None):
     return log_probs.gather(-1, tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
 
 
-def run_teacher_pipeline(teacher, sequences, attention_mask, group_size,
+def run_teacher_pipeline(teacher, sequences, attention_mask, chunk_size,
                          device, student_device, queue):
     """Producer: compute teacher logprobs in chunks, push to queue."""
-    for i in range(0, len(sequences), group_size):
-        chunk_seq = sequences[i:i + group_size].to(device, non_blocking=True)
-        chunk_mask = attention_mask[i:i + group_size].to(device, non_blocking=True)
+    for i in range(0, len(sequences), chunk_size):
+        chunk_seq = sequences[i:i + chunk_size].to(device, non_blocking=True)
+        chunk_mask = attention_mask[i:i + chunk_size].to(device, non_blocking=True)
         with torch.inference_mode():
             t_out = teacher(input_ids=chunk_seq, attention_mask=chunk_mask)
         logprobs = get_logprobs_at_tokens(t_out.logits, chunk_seq)
@@ -457,25 +458,61 @@ def main():
             completion_mask = (positions >= prompt_lens_t) & (sequences != PAD_TOKEN_ID)
             hit_eos = ((sequences == tokenizer.eos_token_id) & completion_mask).any(dim=1)
 
-            # Producer-consumer pipeline: teacher is faster (no backward, no grad
-            # checkpointing) so it races ahead by 2-3 chunks, keeping both GPUs busy.
-            # maxsize=4 bounds memory so teacher doesn't cache too many logprobs.
+            # Collect all teacher logprobs up front so we can normalize
+            # advantages per-group (all GROUP_SIZE rollouts from one prompt)
+            micro_batch_size = MICRO_BATCH_SIZE
+            n_micro_batches = len(sequences) // micro_batch_size
+            all_teacher_logprobs = []
             teacher_queue = Queue(maxsize=4)
             teacher_thread = teacher_executor.submit(
                 run_teacher_pipeline, teacher_compiled, sequences, attention_mask,
-                group_size, TEACHER_DEVICE, STUDENT_DEVICE, teacher_queue
+                micro_batch_size, TEACHER_DEVICE, STUDENT_DEVICE, teacher_queue
             )
+            while True:
+                chunk = teacher_queue.get()
+                if chunk is None:
+                    break
+                all_teacher_logprobs.append(chunk)
+            teacher_thread.result()
+            all_teacher_logprobs = torch.cat(all_teacher_logprobs, dim=0)
 
-            # Inner loop: micro-batches over pre-generated sequences
-            for micro_idx in range(GRAD_ACCUM_STEPS):
-                start = micro_idx * group_size
-                end = start + group_size
+            # Pre-compute advantages for all sequences
+            old_logprobs_shifted_all = old_student_logprobs[:, 1:].to(STUDENT_DEVICE)
+            raw_advantage = -(old_logprobs_shifted_all - all_teacher_logprobs)
+
+            # No-EOS penalty: discourage sequences that never terminated
+            NO_EOS_PENALTY = -0.25
+            loss_mask_all = build_loss_mask(sequences.to(STUDENT_DEVICE), prompt_lens, PAD_TOKEN_ID)
+            no_eos_mask = (~hit_eos).float().unsqueeze(1).to(STUDENT_DEVICE)
+            raw_advantage = raw_advantage + NO_EOS_PENALTY * loss_mask_all * no_eos_mask
+
+            # Normalize per-group (group_size consecutive sequences from same prompt)
+            for g in range(0, len(raw_advantage), group_size):
+                group_adv = raw_advantage[g:g + group_size]
+                group_mask = loss_mask_all[g:g + group_size]
+                masked = group_adv * group_mask
+                total_tokens = group_mask.sum()
+                mean = masked.sum() / total_tokens
+                var = ((masked - mean * group_mask) ** 2 * group_mask).sum() / total_tokens
+                raw_advantage[g:g + group_size] = (group_adv - mean) / (var.sqrt() + 1e-8)
+
+            total_generated_tokens = loss_mask_all.sum().item()
+
+            # Gradient diagnostics (first 3 steps only)
+            if global_step < 3:
+                print(f"--- Advantage diagnostics (step {global_step}) ---")
+                ms = max(loss_mask_all.sum().item(), 1)
+                print(f"raw advantage abs mean: {(raw_advantage * loss_mask_all).abs().sum().item() / ms:.6f}")
+                print(f"no-EOS frac: {(~hit_eos).float().mean().item():.3f}")
+                print("---")
+
+            # Inner loop: student forward + backward only
+            for micro_idx in range(n_micro_batches):
+                start = micro_idx * micro_batch_size
+                end = start + micro_batch_size
                 mb_seq = sequences[start:end]
-                mb_plens = prompt_lens[start:end]
-                mb_old_lp = old_student_logprobs[start:end]
                 mb_mask = attention_mask[start:end]
 
-                # Move inputs once
                 student_input = mb_seq.to(STUDENT_DEVICE, non_blocking=True)
                 student_mask = mb_mask.to(STUDENT_DEVICE, non_blocking=True)
 
@@ -485,9 +522,9 @@ def main():
                 )
                 current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input, SHARED_VOCAB_SIZE)
 
-                teacher_logprobs = teacher_queue.get()  # blocks only if teacher behind
-
-                loss_mask = build_loss_mask(student_input, mb_plens, PAD_TOKEN_ID)
+                mb_advantage = raw_advantage[start:end].detach()
+                mb_loss_mask = loss_mask_all[start:end]
+                mb_old_lp = old_logprobs_shifted_all[start:end]
 
                 # Gradient chain diagnostics (first 3 steps only)
                 if global_step < 3 and micro_idx == 0:
@@ -495,49 +532,23 @@ def main():
                     print(f"logits.grad_fn: {student_out.logits.grad_fn}")
                     print(f"logits.requires_grad: {student_out.logits.requires_grad}")
                     print(f"current_logprobs.grad_fn: {current_logprobs.grad_fn}")
-                    print(f"loss_mask sum: {loss_mask.sum().item()}")
+                    print(f"loss_mask sum: {mb_loss_mask.sum().item()}")
 
-                seq_lens = mb_mask.to(STUDENT_DEVICE).sum(dim=1)
-                prompt_lens_t = torch.tensor(mb_plens, device=STUDENT_DEVICE)
-                avg_gen_len = (seq_lens - prompt_lens_t).float().mean()
-
-                num_generated_tokens = loss_mask.sum().item()
-                total_generated_tokens += num_generated_tokens
-
-                old_logprobs_shifted = mb_old_lp[:, 1:].to(STUDENT_DEVICE)
-                advantage = -(old_logprobs_shifted - teacher_logprobs)
-
-                # No-EOS penalty: discourage sequences that never terminated
-                NO_EOS_PENALTY = -5.0
-                mb_hit_eos = hit_eos[start:end].to(STUDENT_DEVICE)
-                no_eos_mask = (~mb_hit_eos).float().unsqueeze(1)  # [group_size, 1]
-                advantage = advantage + NO_EOS_PENALTY * loss_mask * no_eos_mask
-
-                # Per-group normalization: each micro-batch is already one group
-                # (group_size rollouts from one prompt). Reshape if BATCH_SIZE > 1.
-                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-
-                ratio = torch.exp(current_logprobs - old_logprobs_shifted)
-                per_token_loss = -ratio * advantage.detach()
-                masked_loss = (per_token_loss * loss_mask).sum() / loss_mask.sum()
+                ratio = torch.exp(current_logprobs - mb_old_lp)
+                per_token_loss = -ratio * mb_advantage
+                masked_loss = (per_token_loss * mb_loss_mask).sum() / mb_loss_mask.sum()
 
                 # Gradient chain diagnostics continued
                 if global_step < 3 and micro_idx == 0:
-                    ms = max(loss_mask.sum().item(), 1)
-                    print(f"advantage abs mean: {(advantage * loss_mask).abs().sum().item() / ms:.6f}")
-                    print(f"ratio mean (should be ~1): {(ratio * loss_mask).sum().item() / ms:.6f}")
+                    ms = max(mb_loss_mask.sum().item(), 1)
+                    print(f"ratio mean (should be ~1): {(ratio * mb_loss_mask).sum().item() / ms:.6f}")
                     print(f"masked_loss: {masked_loss.item():.6f}")
                     print(f"masked_loss.grad_fn: {masked_loss.grad_fn}")
                     print("---")
 
-                # Scale loss for gradient accumulation
-                scaled_loss = masked_loss / GRAD_ACCUM_STEPS
+                scaled_loss = masked_loss / n_micro_batches
                 scaled_loss.backward()
                 accumulated_loss += scaled_loss.item()
-
-            # Drain sentinel and propagate any teacher exception
-            assert teacher_queue.get() is None
-            teacher_thread.result()
 
             # --- Optimizer step (after all micro-batches) ---
             # Verify gradients exist (first few steps, before zero_grad)
@@ -560,21 +571,26 @@ def main():
 
             tokens_per_sec = total_generated_tokens / gen_time if gen_time > 0 else 0
 
-            # Log metrics — batch all GPU->CPU transfers into one sync
-            # (uses values from last micro-batch, same as before)
-            mask_sum = loss_mask.sum()
+            # Log metrics using pre-computed all-sequence tensors
+            # (last micro-batch ratio/current_logprobs used for drift/clip stats)
+            mask_sum_all = loss_mask_all.sum()
+            mask_sum_mb = mb_loss_mask.sum()
+            seq_lens_all = attention_mask.to(STUDENT_DEVICE).sum(dim=1)
+            prompt_lens_all_t = torch.tensor(prompt_lens, device=STUDENT_DEVICE)
+            avg_gen_len = (seq_lens_all - prompt_lens_all_t).float().mean()
+
             metrics_tensor = torch.stack(
                 [
                     grad_norm,
-                    (advantage * loss_mask).sum() / mask_sum,
-                    (ratio * loss_mask).sum() / mask_sum,
-                    ((old_logprobs_shifted - teacher_logprobs) * loss_mask).sum()
-                    / mask_sum,
-                    ((ratio > 1.2) | (ratio < 0.8)).float().sum() / mask_sum,
+                    (raw_advantage * loss_mask_all).sum() / mask_sum_all,
+                    (ratio * mb_loss_mask).sum() / mask_sum_mb,
+                    ((old_logprobs_shifted_all - all_teacher_logprobs) * loss_mask_all).sum()
+                    / mask_sum_all,
+                    ((ratio > 1.2) | (ratio < 0.8)).float().sum() / mask_sum_mb,
                     (
-                        (current_logprobs - old_logprobs_shifted).abs() * loss_mask
+                        (current_logprobs - mb_old_lp).abs() * mb_loss_mask
                     ).sum()
-                    / mask_sum,
+                    / mask_sum_mb,
                 ]
             )
             (
@@ -601,6 +617,7 @@ def main():
                 "train/ratio_clipped_frac": ratio_clipped_frac,
                 "train/approx_policy_drift": approx_policy_drift,
                 "train/avg_gen_length": avg_gen_len.item(),
+                "train/no_eos_frac": (~hit_eos).float().mean().item(),
             }
             if last_sync_duration is not None:
                 log_payload["train/sync_duration_sec"] = last_sync_duration
