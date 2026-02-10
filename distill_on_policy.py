@@ -41,9 +41,9 @@ N_EPOCHS = 1
 GROUP_SIZE = 2  # number of rollouts per prompt
 GRAD_ACCUM_STEPS = 64
 MAX_CONTEXT_LENGTH = 2048
-LR = 1e-7
-SYNC_EVERY_N_STEPS = 1
-SYNC_MIN = 1
+LR = 1e-4
+SYNC_EVERY_N_STEPS = 2
+SYNC_MIN = 2 
 SYNC_MAX = 16
 
 RESUME_FROM = None  # or "checkpoints/step_1000"
@@ -98,7 +98,7 @@ def run_teacher_pipeline(teacher, sequences, attention_mask, group_size,
 
 
 def generate_rollouts(
-    vllm_student, prompts, pad_token_id, group_size=1, max_context_length=4096
+    vllm_student, prompts, pad_token_id, group_size=1, max_context_length=4096, vocab_size=None
 ):
     """Generate rollouts from student model using vLLM, returning sequences and prompt length."""
     prompt_lens = [len(p) for p in prompts]
@@ -144,6 +144,10 @@ def generate_rollouts(
     ]
 
     sequences = torch.tensor(padded)
+    # Replace token IDs outside the shared vocab with pad so they're masked
+    # out of attention and loss (student's padded vocab > teacher's vocab)
+    if vocab_size is not None:
+        sequences[sequences >= vocab_size] = pad_token_id
     attention_mask = (sequences != pad_token_id).long()
     old_logprobs = torch.tensor(padded_logprobs)
     expanded_prompt_lens = [pl for pl in prompt_lens for _ in range(group_size)]
@@ -436,7 +440,7 @@ def main():
             gen_start_time = time.time()
             sequences, prompt_lens, old_student_logprobs, attention_mask = (
                 generate_rollouts(
-                    vllm_student, prompts, PAD_TOKEN_ID, group_size, max_context
+                    vllm_student, prompts, PAD_TOKEN_ID, group_size, max_context, SHARED_VOCAB_SIZE
                 )
             )
             gen_time = time.time() - gen_start_time
@@ -446,6 +450,12 @@ def main():
                 print(f"[opt_step {opt_step_idx}] Rollout sample: {tokenizer.decode(sequences[0].tolist()[:200])}")
 
             total_generated_tokens = 0
+
+            # Flag sequences that hit max_length without EOS (vectorized)
+            positions = torch.arange(sequences.shape[1]).unsqueeze(0)
+            prompt_lens_t = torch.tensor(prompt_lens).unsqueeze(1)
+            completion_mask = (positions >= prompt_lens_t) & (sequences != PAD_TOKEN_ID)
+            hit_eos = ((sequences == tokenizer.eos_token_id) & completion_mask).any(dim=1)
 
             # Producer-consumer pipeline: teacher is faster (no backward, no grad
             # checkpointing) so it races ahead by 2-3 chunks, keeping both GPUs busy.
@@ -497,6 +507,16 @@ def main():
                 old_logprobs_shifted = mb_old_lp[:, 1:].to(STUDENT_DEVICE)
                 advantage = -(old_logprobs_shifted - teacher_logprobs)
 
+                # No-EOS penalty: discourage sequences that never terminated
+                NO_EOS_PENALTY = -5.0
+                mb_hit_eos = hit_eos[start:end].to(STUDENT_DEVICE)
+                no_eos_mask = (~mb_hit_eos).float().unsqueeze(1)  # [group_size, 1]
+                advantage = advantage + NO_EOS_PENALTY * loss_mask * no_eos_mask
+
+                # Per-group normalization: each micro-batch is already one group
+                # (group_size rollouts from one prompt). Reshape if BATCH_SIZE > 1.
+                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
                 ratio = torch.exp(current_logprobs - old_logprobs_shifted)
                 per_token_loss = -ratio * advantage.detach()
                 masked_loss = (per_token_loss * loss_mask).sum() / loss_mask.sum()
@@ -530,7 +550,7 @@ def main():
                 print(f"Step {global_step + 1}: gradients exist = {has_grads}")
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                student.parameters(), max_norm=50.0
+                student.parameters(), max_norm=1.0
             )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
