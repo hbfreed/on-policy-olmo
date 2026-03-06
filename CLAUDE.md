@@ -1,0 +1,2 @@
+- Use `uv run` to run scripts (e.g. `uv run bash sweep_lr.sh`, `uv run python distill_off_policy.py`)
+- No need to chmod scripts — `uv run bash` handles it

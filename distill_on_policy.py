@@ -1,3 +1,4 @@
+import argparse
 import io
 import os
 import time
@@ -11,10 +12,11 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from tqdm import tqdm
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_constant_schedule_with_warmup
 from vllm import LLM, SamplingParams
 
 import wandb
+from evals import run_evals
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -24,8 +26,8 @@ torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 # DATASET = "allenai/Dolci-Think-RL-7B"
 DATASET = "allenai/Dolci-Instruct-RL"
-TEACHER = "allenai/OLMo-2-0425-1B-Instruct"
-STUDENT = "allenai/OLMo-2-0425-1B-SFT"
+TEACHER = "allenai/Olmo-3-7B-Instruct"
+STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
 HUB_REPO = None  # "hbfreed/Olmo-2-1B-Distilled"
 WANDB_PROJECT = "olmo-2-1b-on-policy-distillation"
 RUN_NAME = None  # set to a string to override auto naming
@@ -38,10 +40,10 @@ BATCH_SIZE = 1
 N_EPOCHS = 1
 GROUP_SIZE = 4  # number of rollouts per prompt
 MICRO_BATCH_SIZE = 2  # sequences per student/teacher forward pass (decoupled from group_size)
-TEACHER_MICRO_BATCH_SIZE = 12
-GRAD_ACCUM_STEPS = 64
+TEACHER_MICRO_BATCH_SIZE = 6
+GRAD_ACCUM_STEPS = 256
 MAX_CONTEXT_LENGTH = 2048
-LR = 3e-5
+LR = 1e-5
 CLIP_EPS = 0.2
 MAX_GRAD_NORM = 3.0
 WARMUP_STEPS = 50
@@ -52,7 +54,10 @@ SYNC_MAX = 4
 RESUME_FROM = None
 DEBUG_MODE = False
 N_SAMPLE_PROMPTS = 4
-SAMPLE_EVERY_N_STEPS = 200
+SAMPLE_EVERY_N_STEPS = 50
+EVAL_EVERY_N_STEPS = 50
+EVAL_N_SAMPLES = 200
+EVAL_TASKS = ["gsm8k_cot", "arc_easy", "truthfulqa_mc2", "ifeval"]
 
 steps_since_decrease = 0
 
@@ -62,7 +67,7 @@ torch.manual_seed(1223)
 def get_sync_interval(step, mean_ratio, approx_drift, current_interval):
     global steps_since_decrease
 
-    if step < 50:
+    if step < 5:
         return 1
 
     # Danger — policy drifted too far, importance sampling unreliable
@@ -174,6 +179,27 @@ def generate_rollouts(
     return sequences, expanded_prompt_lens, old_logprobs, attention_mask
 
 
+def prepare_prompts(opt_step_idx, all_batches, tokenizer, grad_accum_steps):
+    """Tokenize prompts for a given optimizer step index."""
+    chunk_start = opt_step_idx * grad_accum_steps
+    chunk_end = chunk_start + grad_accum_steps
+    raw_prompts = [all_batches[i]["prompt"] for i in range(chunk_start, chunk_end)]
+    raw_prompts = [p[0] if isinstance(p, list) else p for p in raw_prompts]
+    return [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}], add_generation_prompt=True
+        )
+        for p in raw_prompts
+    ]
+
+
+def timed_generate_rollouts(*args, **kwargs):
+    """Wrapper that returns generate_rollouts results plus elapsed time."""
+    t0 = time.time()
+    result = generate_rollouts(*args, **kwargs)
+    return (*result, time.time() - t0)
+
+
 def build_loss_mask(sequences, prompt_lens, pad_token_id):
     """
     Build a mask that's 1.0 for completion tokens, 0.0 for prompt and padding.
@@ -219,25 +245,47 @@ def generate_samples(vllm_student, eval_prompts, tokenizer, max_context_length=4
     return table
 
 
-def save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo=None):
-    """Save checkpoint to disk and optionally push to hub."""
-    checkpoint_dir = f"checkpoints/step_{global_step}"
-    os.makedirs(checkpoint_dir, exist_ok=True)
+SAVE_EVERY = 500  # permanent milestone checkpoint every N steps
+CHECKPOINT_BASE = "checkpoints/onpolicy-from-baseline"
 
-    student.save_pretrained(checkpoint_dir)
-    tokenizer.save_pretrained(checkpoint_dir)
+
+def save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo=None):
+    """Save rolling 'latest'/'prev' checkpoints, plus a permanent one every SAVE_EVERY steps."""
+    import shutil
+    latest_dir = f"{CHECKPOINT_BASE}/latest"
+    prev_dir = f"{CHECKPOINT_BASE}/prev"
+
+    # Rotate: latest -> prev (so we always have two recent checkpoints)
+    if os.path.exists(latest_dir):
+        if os.path.exists(prev_dir):
+            shutil.rmtree(prev_dir)
+        os.rename(latest_dir, prev_dir)
+
+    os.makedirs(latest_dir, exist_ok=True)
+    student.save_pretrained(latest_dir)
+    tokenizer.save_pretrained(latest_dir)
     torch.save(
         {"optimizer": optimizer.state_dict(), "step": global_step},
-        f"{checkpoint_dir}/training_state.pt",
+        f"{latest_dir}/training_state.pt",
     )
+    print(f"Saved latest checkpoint (step {global_step}) to {latest_dir}")
 
-    print(f"Saved checkpoint to {checkpoint_dir}")
+    if global_step % SAVE_EVERY == 0:
+        milestone_dir = f"{CHECKPOINT_BASE}/step_{global_step}"
+        os.makedirs(milestone_dir, exist_ok=True)
+        student.save_pretrained(milestone_dir)
+        tokenizer.save_pretrained(milestone_dir)
+        torch.save(
+            {"optimizer": optimizer.state_dict(), "step": global_step},
+            f"{milestone_dir}/training_state.pt",
+        )
+        print(f"Saved milestone checkpoint to {milestone_dir}")
 
     if hub_repo:
         try:
             from huggingface_hub import HfApi
             HfApi().upload_folder(
-                folder_path=checkpoint_dir,
+                folder_path=latest_dir,
                 repo_id=hub_repo,
                 commit_message=f"Step {global_step}",
                 ignore_patterns=["training_state.pt"],
@@ -253,19 +301,13 @@ def sync_weights_to_vllm(hf_model, vllm_llm):
     Uses collective_rpc to update weights in V1 architecture.
     See: https://github.com/vllm-project/vllm/issues/5723
     """
-    hf_state_dict = {k: v.cpu() for k, v in hf_model.state_dict().items()}
-    buffer = io.BytesIO()
-    torch.save(hf_state_dict, buffer)
-    weights_bytes = buffer.getvalue()
+    weights = [(k, v.cpu()) for k, v in hf_model.state_dict().items()]
 
-    def load_weights_on_worker(worker, serialized_weights):
-        buf = io.BytesIO(serialized_weights)
-        weights_dict = torch.load(buf, weights_only=True)
-        weights = list(weights_dict.items())
-        worker.model_runner.model.load_weights(weights=weights)
+    def load_weights_on_worker(worker, weight_list):
+        worker.model_runner.model.load_weights(weights=weight_list)
 
     method_bytes = cloudpickle.dumps(load_weights_on_worker)
-    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights_bytes,))
+    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights,))
 
 
 def timed_sync_weights_to_vllm(hf_model, vllm_llm):
@@ -288,7 +330,22 @@ def load_checkpoint(checkpoint_path, student, optimizer, vllm_student=None):
     return 0
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="On-policy distillation")
+    parser.add_argument("--lr", type=float, default=LR, help="Learning rate")
+    parser.add_argument("--sweep", type=int, default=None,
+                        help="Stop after N optimizer steps (for quick LR sweeps)")
+    parser.add_argument("--wandb-run-id", type=str, default=None,
+                        help="Wandb run ID to resume (e.g. xhzvc6kp)")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    lr = args.lr
+    sweep_steps = args.sweep
+    wandb_run_id = args.wandb_run_id
+
     # Load tokenizer
     print(f"Loading tokenizer from {TEACHER}...")
     tokenizer = AutoTokenizer.from_pretrained(TEACHER)
@@ -330,7 +387,7 @@ def main():
 
     steps_per_epoch = len(dataset) // (batch_size * GRAD_ACCUM_STEPS)
     total_steps = steps_per_epoch * n_epochs
-    save_every = max(1, min(500, int(total_steps * 0.02)))
+    save_every = 50  # save rolling 'latest' every 50 steps; milestones at SAVE_EVERY
 
     # Load models
     print(f"Loading student model from {STUDENT}...")
@@ -367,19 +424,21 @@ def main():
 
     student.gradient_checkpointing_enable()
 
-    student_compiled = student
-    teacher_compiled = teacher
+    student_compiled = torch.compile(student)
+    teacher_compiled = torch.compile(teacher)
 
-    optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=LR, betas=(0.9, 0.95), eps=1e-8)
+    optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8)
     warmup_steps = min(WARMUP_STEPS, total_steps // 5)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    scheduler = get_constant_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps
     )
 
     start_step = 0
     if RESUME_FROM:
         start_step = load_checkpoint(RESUME_FROM, student, optimizer, vllm_student)
-        print(f"Resuming from step {start_step}")
+        for _ in range(start_step):
+            scheduler.step()
+        print(f"Resuming from step {start_step}, lr={scheduler.get_last_lr()[0]:.2e}")
 
     def short_name(model_name: str) -> str:
         return model_name.split("/")[-1]
@@ -387,14 +446,16 @@ def main():
     run_name = RUN_NAME
     if run_name is None:
         student_short = short_name(STUDENT).lower().replace("olmo-2-0425-", "olmo")
-        lr_str = f"{LR:.0e}".replace("-0", "-")
+        lr_str = f"{lr:.0e}".replace("-0", "-")
+        sweep_tag = f"-sweep{sweep_steps}" if sweep_steps else ""
         run_name = (
-            f"{student_short}-distill"
-            f"-lr{lr_str}-clip{CLIP_EPS}-sync{SYNC_EVERY_N_STEPS}"
+            f"{student_short}-onpolicy-distill"
+            f"-lr{lr_str}-clip{CLIP_EPS}-sync{SYNC_EVERY_N_STEPS}{sweep_tag}"
         )
 
     wandb.init(
         project=WANDB_PROJECT,
+        id=wandb_run_id,
         name=run_name,
         config={
             "teacher": TEACHER,
@@ -405,14 +466,18 @@ def main():
             "steps_per_epoch": steps_per_epoch,
             "n_epochs": n_epochs,
             "total_steps": total_steps,
-            "lr": LR,
+            "lr": lr,
+            "sweep_steps": sweep_steps,
             "clip_eps": CLIP_EPS,
             "max_grad_norm": MAX_GRAD_NORM,
             "warmup_steps": WARMUP_STEPS,
             "max_context_length": MAX_CONTEXT_LENGTH,
             "resume_from": RESUME_FROM,
+            "eval_every_n_steps": EVAL_EVERY_N_STEPS,
+            "eval_n_samples": EVAL_N_SAMPLES,
+            "eval_tasks": EVAL_TASKS,
         },
-        resume="allow",
+        resume="must" if wandb_run_id else "allow",
     )
 
     # Baseline generation samples before any training
@@ -438,6 +503,8 @@ def main():
     checkpoint_future = None
     sync_future = None
     sample_future = None
+    eval_future = None
+    gen_future = None  # Future for prefetched next-step generation
     last_sync_duration = None
     sync_interval = SYNC_EVERY_N_STEPS
 
@@ -460,22 +527,46 @@ def main():
                 wandb.log({"eval/samples": sample_future.result()})
                 sample_future = None
 
+            # Drain eval before generate_rollouts — both use the vLLM engine
+            if eval_future is not None:
+                wandb.log(eval_future.result())
+                eval_future = None
+
             opt_step_start_time = time.time()
 
-            # Collect GRAD_ACCUM_STEPS prompts and generate all rollouts at once
-            chunk_start = opt_step_idx * GRAD_ACCUM_STEPS
-            chunk_end = chunk_start + GRAD_ACCUM_STEPS
-            raw_prompts = [all_batches[i]["prompt"] for i in range(chunk_start, chunk_end)]
-            raw_prompts = [p[0] if isinstance(p, list) else p for p in raw_prompts]
-            prompts = [tokenizer.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True) for p in raw_prompts]
-
-            gen_start_time = time.time()
-            sequences, prompt_lens, old_student_logprobs, attention_mask = (
-                generate_rollouts(
-                    vllm_student, prompts, PAD_TOKEN_ID, group_size, max_context, SHARED_VOCAB_SIZE
+            # Use prefetched generation if available, otherwise generate synchronously
+            if gen_future is not None:
+                sequences, prompt_lens, old_student_logprobs, attention_mask, gen_time = (
+                    gen_future.result()
                 )
+                gen_future = None
+            else:
+                prompts = prepare_prompts(opt_step_idx, all_batches, tokenizer, GRAD_ACCUM_STEPS)
+                gen_start_time = time.time()
+                sequences, prompt_lens, old_student_logprobs, attention_mask = (
+                    generate_rollouts(
+                        vllm_student, prompts, PAD_TOKEN_ID, group_size, max_context, SHARED_VOCAB_SIZE
+                    )
+                )
+                gen_time = time.time() - gen_start_time
+
+            # Prefetch next step's generation (overlaps with training below)
+            next_step_idx = opt_step_idx + 1
+            will_sync = (global_step + 1) % sync_interval == 0
+            can_prefetch = (
+                next_step_idx < steps_per_epoch
+                and sync_interval > 1
+                and not will_sync
             )
-            gen_time = time.time() - gen_start_time
+            if can_prefetch:
+                next_prompts = prepare_prompts(
+                    next_step_idx, all_batches, tokenizer, GRAD_ACCUM_STEPS
+                )
+                gen_future = vllm_executor.submit(
+                    timed_generate_rollouts,
+                    vllm_student, next_prompts, PAD_TOKEN_ID,
+                    group_size, max_context, SHARED_VOCAB_SIZE,
+                )
 
             # Print a decoded rollout to check if training data is coherent
             if opt_step_idx < 2:
@@ -647,6 +738,9 @@ def main():
 
             # Sync updated weights to vLLM for on-policy generation
             if global_step % sync_interval == 0:
+                if gen_future is not None:
+                    # Sync needed — discard prefetched stale rollouts
+                    gen_future = None
                 if sync_future is None or sync_future.done():
                     sync_future = vllm_executor.submit(
                         timed_sync_weights_to_vllm, student, vllm_student
@@ -660,6 +754,13 @@ def main():
                     eval_prompts,
                     tokenizer,
                     max_context,
+                )
+
+            # Run benchmark evals (async via vllm_executor)
+            if global_step % EVAL_EVERY_N_STEPS == 0 and eval_future is None:
+                eval_future = vllm_executor.submit(
+                    run_evals, vllm_student, tokenizer, STUDENT,
+                    tasks=EVAL_TASKS, limit=EVAL_N_SAMPLES,
                 )
 
             # Save checkpoint (async - don't block training)
@@ -678,13 +779,23 @@ def main():
                     hub_repo,
                 )
 
+            # Early stop for LR sweep
+            if sweep_steps and global_step >= sweep_steps:
+                print(f"Sweep: stopping after {sweep_steps} steps")
+                break
+
+        if sweep_steps and global_step >= sweep_steps:
+            break
+
     pbar.close()
 
-    # Wait for any pending sync/checkpoint/samples
+    # Wait for any pending sync/checkpoint/samples/evals
     if sync_future is not None:
         sync_future.result()
     if sample_future is not None:
         wandb.log({"eval/samples": sample_future.result()})
+    if eval_future is not None:
+        wandb.log(eval_future.result())
     if checkpoint_future is not None:
         checkpoint_future.result()
 
