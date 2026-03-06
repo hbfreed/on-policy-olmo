@@ -88,16 +88,28 @@ def get_sync_interval(step, mean_ratio, approx_drift, current_interval):
 def get_logprobs_at_tokens(logits, tokens, vocab_size=None):
     if vocab_size is not None:
         logits = logits[:, :, :vocab_size]
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-    return log_probs.gather(-1, tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
+    # Use F.cross_entropy which fuses log_softmax + gather internally,
+    # avoiding materializing the full [B, T, V] log_softmax tensor (~1.5 GiB).
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = tokens[:, 1:].contiguous()
+    B, T, V = shift_logits.shape
+    return -F.cross_entropy(
+        shift_logits.view(B * T, V), shift_labels.view(B * T),
+        reduction="none",
+    ).view(B, T)
 
 
 def run_teacher_pipeline(teacher, sequences, attention_mask, chunk_size,
                          device, student_device, queue, consumer_chunk_size=None):
-    """Producer: compute teacher logprobs in chunks, split into consumer-sized pieces."""
+    """Producer: compute teacher logprobs in chunks, emit exact consumer-sized pieces.
+
+    Buffers across teacher chunks to handle non-aligned sizes (e.g. teacher=6, consumer=4).
+    """
     if consumer_chunk_size is None:
         consumer_chunk_size = chunk_size
     try:
+        buffer = []
+        buffered_rows = 0
         for i in range(0, len(sequences), chunk_size):
             chunk_seq = sequences[i:i + chunk_size].to(device, non_blocking=True)
             chunk_mask = attention_mask[i:i + chunk_size].to(device, non_blocking=True)
@@ -113,8 +125,17 @@ def run_teacher_pipeline(teacher, sequences, attention_mask, chunk_size,
                 )
             logprobs = get_logprobs_at_tokens(t_out.logits, chunk_seq)
             logprobs = logprobs.to(student_device).detach()
-            for j in range(0, logprobs.shape[0], consumer_chunk_size):
-                queue.put(logprobs[j:j + consumer_chunk_size])
+            buffer.append(logprobs)
+            buffered_rows += logprobs.shape[0]
+            # Emit complete consumer-sized chunks from buffer
+            while buffered_rows >= consumer_chunk_size:
+                combined = torch.cat(buffer, dim=0)
+                queue.put(combined[:consumer_chunk_size])
+                remainder = combined[consumer_chunk_size:]
+                buffer = [remainder] if remainder.shape[0] > 0 else []
+                buffered_rows = remainder.shape[0]
+        # Drop any leftover rows that don't fill a complete consumer chunk
+        # (student loop only processes n_sequences // consumer_chunk_size chunks)
         queue.put(None)  # sentinel
     except Exception as e:
         queue.put(e)  # unblock consumer so it doesn't hang
@@ -301,13 +322,19 @@ def sync_weights_to_vllm(hf_model, vllm_llm):
     Uses collective_rpc to update weights in V1 architecture.
     See: https://github.com/vllm-project/vllm/issues/5723
     """
-    weights = [(k, v.cpu()) for k, v in hf_model.state_dict().items()]
+    hf_state_dict = {k: v.cpu() for k, v in hf_model.state_dict().items()}
+    buffer = io.BytesIO()
+    torch.save(hf_state_dict, buffer)
+    weights_bytes = buffer.getvalue()
 
-    def load_weights_on_worker(worker, weight_list):
-        worker.model_runner.model.load_weights(weights=weight_list)
+    def load_weights_on_worker(worker, serialized_weights):
+        buf = io.BytesIO(serialized_weights)
+        weights_dict = torch.load(buf, weights_only=True)
+        weights = list(weights_dict.items())
+        worker.model_runner.model.load_weights(weights=weights)
 
     method_bytes = cloudpickle.dumps(load_weights_on_worker)
-    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights,))
+    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights_bytes,))
 
 
 def timed_sync_weights_to_vllm(hf_model, vllm_llm):
@@ -423,9 +450,8 @@ def main():
     )
 
     student.gradient_checkpointing_enable()
-
-    student_compiled = torch.compile(student)
-    teacher_compiled = torch.compile(teacher)
+    student_compiled = student
+    teacher_compiled = teacher
 
     optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8)
     warmup_steps = min(WARMUP_STEPS, total_steps // 5)
