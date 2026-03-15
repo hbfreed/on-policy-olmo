@@ -41,7 +41,9 @@ htmlcov/
 *.pth
 *.bin
 *.safetensors
+*.npy
 checkpoints/
+data_cache/
 outputs/
 logs/
 wandb/

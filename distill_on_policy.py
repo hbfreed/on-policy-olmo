@@ -1,21 +1,56 @@
 import argparse
-import io
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 
 import bitsandbytes as bnb
-import cloudpickle
 import torch
-import torch.nn.functional as F
 from datasets import load_dataset
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from tqdm import tqdm
 from transformers import AutoTokenizer, get_constant_schedule_with_warmup
-from vllm import LLM, SamplingParams
+from vllm import LLM
 
 import wandb
+from distill_utils import (
+    BATCH_SIZE,
+    CLIP_EPS,
+    DATASET,
+    DEBUG_MODE,
+    EVAL_EVERY_N_STEPS,
+    EVAL_N_SAMPLES,
+    EVAL_TASKS,
+    GRAD_ACCUM_STEPS,
+    GROUP_SIZE,
+    HUB_REPO,
+    LR,
+    MAX_CONTEXT_LENGTH,
+    MAX_GRAD_NORM,
+    MICRO_BATCH_SIZE,
+    N_EPOCHS,
+    N_SAMPLE_PROMPTS,
+    RUN_NAME,
+    SAMPLE_EVERY_N_STEPS,
+    STUDENT,
+    STUDENT_DEVICE,
+    SYNC_EVERY_N_STEPS,
+    TEACHER,
+    TEACHER_DEVICE,
+    TEACHER_MICRO_BATCH_SIZE,
+    WANDB_PROJECT,
+    WARMUP_STEPS,
+    build_loss_mask,
+    generate_rollouts,
+    generate_samples,
+    get_logprobs_at_tokens,
+    get_sync_interval,
+    load_checkpoint,
+    prepare_prompts,
+    run_teacher_pipeline,
+    save_checkpoint,
+    timed_generate_rollouts,
+    timed_sync_weights_to_vllm,
+)
 from evals import run_evals
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -24,337 +59,7 @@ torch.backends.cudnn.benchmark = True
 torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
-# DATASET = "allenai/Dolci-Think-RL-7B"
-DATASET = "allenai/Dolci-Instruct-RL"
-TEACHER = "allenai/Olmo-3-7B-Instruct"
-STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
-HUB_REPO = None  # "hbfreed/Olmo-2-1B-Distilled"
-WANDB_PROJECT = "olmo-2-1b-on-policy-distillation"
-RUN_NAME = None  # set to a string to override auto naming
-
-STUDENT_DEVICE = "cuda:2"  # HF student for training
-TEACHER_DEVICE = "cuda:1"  # HF teacher for inference
-VLLM_DEVICE = "cuda:0"  # vLLM student for fast generation (vLLM uses first visible GPU)
-
-BATCH_SIZE = 1
-N_EPOCHS = 1
-GROUP_SIZE = 4  # number of rollouts per prompt
-MICRO_BATCH_SIZE = 2  # sequences per student/teacher forward pass (decoupled from group_size)
-TEACHER_MICRO_BATCH_SIZE = 6
-GRAD_ACCUM_STEPS = 256
-MAX_CONTEXT_LENGTH = 2048
-LR = 1e-5
-CLIP_EPS = 0.2
-MAX_GRAD_NORM = 3.0
-WARMUP_STEPS = 50
-SYNC_EVERY_N_STEPS = 4
-SYNC_MIN = 1
-SYNC_MAX = 4
-
-RESUME_FROM = None
-DEBUG_MODE = False
-N_SAMPLE_PROMPTS = 4
-SAMPLE_EVERY_N_STEPS = 50
-EVAL_EVERY_N_STEPS = 50
-EVAL_N_SAMPLES = 200
-EVAL_TASKS = ["gsm8k_cot", "arc_easy", "truthfulqa_mc2", "ifeval"]
-
-steps_since_decrease = 0
-
 torch.manual_seed(1223)
-
-
-def get_sync_interval(step, mean_ratio, approx_drift, current_interval):
-    global steps_since_decrease
-
-    if step < 5:
-        return 1
-
-    # Danger — policy drifted too far, importance sampling unreliable
-    if abs(mean_ratio - 1.0) > 0.2 or approx_drift > 0.25:
-        steps_since_decrease = 0
-        return max(SYNC_MIN, current_interval // 2)
-
-    steps_since_decrease += 1
-
-    # Comfortable for a while — try pushing
-    if (abs(mean_ratio - 1.0) < 0.05 and approx_drift < 0.08
-            and steps_since_decrease > 20):
-        return min(SYNC_MAX, current_interval + 1)
-
-    return current_interval
-
-
-def get_logprobs_at_tokens(logits, tokens, vocab_size=None):
-    if vocab_size is not None:
-        logits = logits[:, :, :vocab_size]
-    # Use F.cross_entropy which fuses log_softmax + gather internally,
-    # avoiding materializing the full [B, T, V] log_softmax tensor (~1.5 GiB).
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = tokens[:, 1:].contiguous()
-    B, T, V = shift_logits.shape
-    return -F.cross_entropy(
-        shift_logits.view(B * T, V), shift_labels.view(B * T),
-        reduction="none",
-    ).view(B, T)
-
-
-def run_teacher_pipeline(teacher, sequences, attention_mask, chunk_size,
-                         device, student_device, queue, consumer_chunk_size=None):
-    """Producer: compute teacher logprobs in chunks, emit exact consumer-sized pieces.
-
-    Buffers across teacher chunks to handle non-aligned sizes (e.g. teacher=6, consumer=4).
-    """
-    if consumer_chunk_size is None:
-        consumer_chunk_size = chunk_size
-    try:
-        buffer = []
-        buffered_rows = 0
-        for i in range(0, len(sequences), chunk_size):
-            chunk_seq = sequences[i:i + chunk_size].to(device, non_blocking=True)
-            chunk_mask = attention_mask[i:i + chunk_size].to(device, non_blocking=True)
-            try:
-                with torch.inference_mode():
-                    t_out = teacher(input_ids=chunk_seq, attention_mask=chunk_mask)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                raise RuntimeError(
-                    f"Teacher OOM with batch_size={chunk_seq.shape[0]}, "
-                    f"seq_len={chunk_seq.shape[1]}. Reduce TEACHER_MICRO_BATCH_SIZE "
-                    f"(currently {chunk_size})."
-                )
-            logprobs = get_logprobs_at_tokens(t_out.logits, chunk_seq)
-            logprobs = logprobs.to(student_device).detach()
-            buffer.append(logprobs)
-            buffered_rows += logprobs.shape[0]
-            # Emit complete consumer-sized chunks from buffer
-            while buffered_rows >= consumer_chunk_size:
-                combined = torch.cat(buffer, dim=0)
-                queue.put(combined[:consumer_chunk_size])
-                remainder = combined[consumer_chunk_size:]
-                buffer = [remainder] if remainder.shape[0] > 0 else []
-                buffered_rows = remainder.shape[0]
-        # Drop any leftover rows that don't fill a complete consumer chunk
-        # (student loop only processes n_sequences // consumer_chunk_size chunks)
-        queue.put(None)  # sentinel
-    except Exception as e:
-        queue.put(e)  # unblock consumer so it doesn't hang
-        raise
-
-
-def generate_rollouts(
-    vllm_student, prompts, pad_token_id, group_size=1, max_context_length=4096, vocab_size=None
-):
-    """Generate rollouts from student model using vLLM, returning sequences and prompt length."""
-    prompt_lens = [len(p) for p in prompts]
-    max_prompt_len = max(prompt_lens)
-    max_new_tokens = max_context_length - max_prompt_len
-
-    sampling_params = SamplingParams(
-        temperature=1.0,
-        top_p=1.0,
-        max_tokens=max_new_tokens,
-        n=group_size,
-        logprobs=1,
-    )
-
-    token_prompts = [{"prompt_token_ids": p} for p in prompts]
-    outputs = vllm_student.generate(
-        prompts=token_prompts,
-        sampling_params=sampling_params,
-        use_tqdm=False,
-    )
-
-    # Convert vLLM outputs to tensor: each RequestOutput has `outputs` list
-    # With n=group_size, we get group_size completions per prompt
-    all_sequences = []
-    all_logprobs = []
-    for req_output, prompt_len in zip(outputs, prompt_lens):
-        prompt_ids = req_output.prompt_token_ids
-        for completion in req_output.outputs:
-            # Combine prompt + generated tokens
-            full_seq = list(prompt_ids) + list(completion.token_ids)
-            all_sequences.append(full_seq)
-            seq_logprobs = [0.0] * prompt_len
-            for idx, logprob_dict in enumerate(completion.logprobs):
-                token_id = completion.token_ids[idx]
-                seq_logprobs.append(logprob_dict[token_id].logprob)
-            all_logprobs.append(seq_logprobs)
-
-    # Pad sequences to same length (right pad with pad_token_id)
-    max_seq_len = max(len(seq) for seq in all_sequences)
-    padded = [seq + [pad_token_id] * (max_seq_len - len(seq)) for seq in all_sequences]
-    padded_logprobs = [
-        logprob + [0.0] * (max_seq_len - len(logprob)) for logprob in all_logprobs
-    ]
-
-    sequences = torch.tensor(padded)
-    # Replace token IDs outside the shared vocab with pad so they're masked
-    # out of attention and loss (student's padded vocab > teacher's vocab)
-    if vocab_size is not None:
-        sequences[sequences >= vocab_size] = pad_token_id
-    attention_mask = (sequences != pad_token_id).long()
-    old_logprobs = torch.tensor(padded_logprobs)
-    expanded_prompt_lens = [pl for pl in prompt_lens for _ in range(group_size)]
-
-    return sequences, expanded_prompt_lens, old_logprobs, attention_mask
-
-
-def prepare_prompts(opt_step_idx, all_batches, tokenizer, grad_accum_steps):
-    """Tokenize prompts for a given optimizer step index."""
-    chunk_start = opt_step_idx * grad_accum_steps
-    chunk_end = chunk_start + grad_accum_steps
-    raw_prompts = [all_batches[i]["prompt"] for i in range(chunk_start, chunk_end)]
-    raw_prompts = [p[0] if isinstance(p, list) else p for p in raw_prompts]
-    return [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}], add_generation_prompt=True
-        )
-        for p in raw_prompts
-    ]
-
-
-def timed_generate_rollouts(*args, **kwargs):
-    """Wrapper that returns generate_rollouts results plus elapsed time."""
-    t0 = time.time()
-    result = generate_rollouts(*args, **kwargs)
-    return (*result, time.time() - t0)
-
-
-def build_loss_mask(sequences, prompt_lens, pad_token_id):
-    """
-    Build a mask that's 1.0 for completion tokens, 0.0 for prompt and padding.
-
-    sequences: [batch, seq_len]
-    prompt_lens: list[int], length = batch (per-sequence prompt lengths)
-    pad_token_id: int
-
-    Returns: [batch, seq_len - 1] (shifted to match logprob indexing)
-    """
-    batch_size, seq_len = sequences.shape
-    positions = torch.arange(seq_len, device=sequences.device).unsqueeze(0)
-    prompt_lens_t = torch.tensor(prompt_lens, device=sequences.device).unsqueeze(1)
-    mask = (positions >= prompt_lens_t).float()
-    mask[sequences == pad_token_id] = 0.0
-    return mask[:, 1:]
-
-
-def generate_samples(vllm_student, eval_prompts, tokenizer, max_context_length=4096):
-    """Generate completions for eval prompts and return a wandb.Table."""
-    prompt_lens = [len(p) for p in eval_prompts]
-    max_prompt_len = max(prompt_lens)
-    sampling_params = SamplingParams(
-        temperature=0.7,
-        max_tokens=max_context_length - max_prompt_len,
-        n=1,
-    )
-    token_prompts = [{"prompt_token_ids": p} for p in eval_prompts]
-    outputs = vllm_student.generate(
-        prompts=token_prompts,
-        sampling_params=sampling_params,
-        use_tqdm=False,
-    )
-    table = wandb.Table(columns=["prompt", "completion"])
-    for req_output in outputs:
-        prompt_text = tokenizer.decode(
-            req_output.prompt_token_ids, skip_special_tokens=True
-        )
-        completion_text = tokenizer.decode(
-            req_output.outputs[0].token_ids, skip_special_tokens=True
-        )
-        table.add_data(prompt_text, completion_text)
-    return table
-
-
-SAVE_EVERY = 500  # permanent milestone checkpoint every N steps
-CHECKPOINT_BASE = "checkpoints/onpolicy-from-baseline"
-
-
-def save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo=None):
-    """Save rolling 'latest'/'prev' checkpoints, plus a permanent one every SAVE_EVERY steps."""
-    import shutil
-    latest_dir = f"{CHECKPOINT_BASE}/latest"
-    prev_dir = f"{CHECKPOINT_BASE}/prev"
-
-    # Rotate: latest -> prev (so we always have two recent checkpoints)
-    if os.path.exists(latest_dir):
-        if os.path.exists(prev_dir):
-            shutil.rmtree(prev_dir)
-        os.rename(latest_dir, prev_dir)
-
-    os.makedirs(latest_dir, exist_ok=True)
-    student.save_pretrained(latest_dir)
-    tokenizer.save_pretrained(latest_dir)
-    torch.save(
-        {"optimizer": optimizer.state_dict(), "step": global_step},
-        f"{latest_dir}/training_state.pt",
-    )
-    print(f"Saved latest checkpoint (step {global_step}) to {latest_dir}")
-
-    if global_step % SAVE_EVERY == 0:
-        milestone_dir = f"{CHECKPOINT_BASE}/step_{global_step}"
-        os.makedirs(milestone_dir, exist_ok=True)
-        student.save_pretrained(milestone_dir)
-        tokenizer.save_pretrained(milestone_dir)
-        torch.save(
-            {"optimizer": optimizer.state_dict(), "step": global_step},
-            f"{milestone_dir}/training_state.pt",
-        )
-        print(f"Saved milestone checkpoint to {milestone_dir}")
-
-    if hub_repo:
-        try:
-            from huggingface_hub import HfApi
-            HfApi().upload_folder(
-                folder_path=latest_dir,
-                repo_id=hub_repo,
-                commit_message=f"Step {global_step}",
-                ignore_patterns=["training_state.pt"],
-            )
-            print(f"Pushed checkpoint to {hub_repo}")
-        except Exception as e:
-            print(f"Failed to push to hub: {e}")
-
-
-def sync_weights_to_vllm(hf_model, vllm_llm):
-    """Sync weights from HF model to vLLM engine for on-policy learning.
-
-    Uses collective_rpc to update weights in V1 architecture.
-    See: https://github.com/vllm-project/vllm/issues/5723
-    """
-    hf_state_dict = {k: v.cpu() for k, v in hf_model.state_dict().items()}
-    buffer = io.BytesIO()
-    torch.save(hf_state_dict, buffer)
-    weights_bytes = buffer.getvalue()
-
-    def load_weights_on_worker(worker, serialized_weights):
-        buf = io.BytesIO(serialized_weights)
-        weights_dict = torch.load(buf, weights_only=True)
-        weights = list(weights_dict.items())
-        worker.model_runner.model.load_weights(weights=weights)
-
-    method_bytes = cloudpickle.dumps(load_weights_on_worker)
-    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights_bytes,))
-
-
-def timed_sync_weights_to_vllm(hf_model, vllm_llm):
-    """Time sync to help pick a data-driven SYNC_EVERY_N_STEPS."""
-    start = time.time()
-    sync_weights_to_vllm(hf_model, vllm_llm)
-    return time.time() - start
-
-
-def load_checkpoint(checkpoint_path, student, optimizer, vllm_student=None):
-    """Load optimizer state and return the step to resume from."""
-    state_path = f"{checkpoint_path}/training_state.pt"
-    if os.path.exists(state_path):
-        state = torch.load(state_path, weights_only=False)
-        optimizer.load_state_dict(state["optimizer"])
-        # Sync loaded weights to vLLM engine
-        if vllm_student is not None:
-            sync_weights_to_vllm(student, vllm_student)
-        return state["step"]
-    return 0
 
 
 def parse_args():
@@ -364,6 +69,15 @@ def parse_args():
                         help="Stop after N optimizer steps (for quick LR sweeps)")
     parser.add_argument("--wandb-run-id", type=str, default=None,
                         help="Wandb run ID to resume (e.g. xhzvc6kp)")
+    parser.add_argument("--checkpoint-base", type=str,
+                        default="checkpoints/onpolicy-from-baseline",
+                        help="Base directory for checkpoints")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Checkpoint path to resume from")
+    parser.add_argument("--save-every", type=int, default=50,
+                        help="Save rolling checkpoint every N steps")
+    parser.add_argument("--milestone-every", type=int, default=500,
+                        help="Save permanent milestone checkpoint every N steps")
     return parser.parse_args()
 
 
@@ -372,6 +86,10 @@ def main():
     lr = args.lr
     sweep_steps = args.sweep
     wandb_run_id = args.wandb_run_id
+    checkpoint_base = args.checkpoint_base
+    resume_from = args.resume_from
+    save_every = args.save_every
+    milestone_every = args.milestone_every
 
     # Load tokenizer
     print(f"Loading tokenizer from {TEACHER}...")
@@ -384,8 +102,8 @@ def main():
     ds = load_dataset(DATASET, split="train")
 
     dataset = (
-        ds.select_columns(["prompt"])
-        .filter(lambda x: len(x["prompt"]) < 2000)
+        ds.select_columns(["prompt", "input_ids_prompt"])
+        .filter(lambda x: len(x["input_ids_prompt"]) < MAX_CONTEXT_LENGTH)
         .shuffle(seed=1223)
     )
 
@@ -401,10 +119,7 @@ def main():
 
     # Fixed eval prompts for tracking generation quality over training
     eval_prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": dataset[i]["prompt"]}],
-            add_generation_prompt=True,
-        )
+        dataset[i]["input_ids_prompt"]
         for i in range(min(N_SAMPLE_PROMPTS, len(dataset)))
     ]
 
@@ -414,13 +129,12 @@ def main():
 
     steps_per_epoch = len(dataset) // (batch_size * GRAD_ACCUM_STEPS)
     total_steps = steps_per_epoch * n_epochs
-    save_every = 50  # save rolling 'latest' every 50 steps; milestones at SAVE_EVERY
 
     # Load models
     print(f"Loading student model from {STUDENT}...")
-    if RESUME_FROM:
+    if resume_from:
         student = AutoLigerKernelForCausalLM.from_pretrained(
-            RESUME_FROM,
+            resume_from,
             dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
         ).to(STUDENT_DEVICE)
@@ -437,21 +151,32 @@ def main():
 
     print(f"Student vocab: {student.config.vocab_size}")
     print(f"Teacher vocab: {teacher.config.vocab_size}")
+    vllm_model_path = resume_from or STUDENT
+    if student.config.vocab_size != teacher.config.vocab_size:
+        print(f"Resizing student embeddings {student.config.vocab_size} -> {teacher.config.vocab_size}")
+        student.resize_token_embeddings(teacher.config.vocab_size)
+        # Save resized model for vLLM (can't sync mismatched shapes)
+        import tempfile
+        vllm_model_path = tempfile.mkdtemp(prefix="olmo_resized_")
+        student.save_pretrained(vllm_model_path)
+        print(f"Saved resized student for vLLM at {vllm_model_path}")
     SHARED_VOCAB_SIZE = student.config.vocab_size
 
     # Initialize vLLM for fast generation on separate GPU
     # skip_tokenizer_init=True since we input token IDs directly
-    print(f"Loading vLLM student on {VLLM_DEVICE}...")
+    print(f"Loading vLLM student on {STUDENT_DEVICE}...")
     vllm_student = LLM(
-        STUDENT,
+        vllm_model_path,
         skip_tokenizer_init=True,
         tensor_parallel_size=1,
         dtype="bfloat16",
     )
+    if vllm_model_path != (resume_from or STUDENT):
+        import shutil
+        shutil.rmtree(vllm_model_path)
+        print(f"Cleaned up temp model at {vllm_model_path}")
 
     student.gradient_checkpointing_enable()
-    student_compiled = student
-    teacher_compiled = teacher
 
     optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8)
     warmup_steps = min(WARMUP_STEPS, total_steps // 5)
@@ -460,8 +185,8 @@ def main():
     )
 
     start_step = 0
-    if RESUME_FROM:
-        start_step = load_checkpoint(RESUME_FROM, student, optimizer, vllm_student)
+    if resume_from:
+        start_step = load_checkpoint(resume_from, student, optimizer, vllm_student)
         for _ in range(start_step):
             scheduler.step()
         print(f"Resuming from step {start_step}, lr={scheduler.get_last_lr()[0]:.2e}")
@@ -498,7 +223,7 @@ def main():
             "max_grad_norm": MAX_GRAD_NORM,
             "warmup_steps": WARMUP_STEPS,
             "max_context_length": MAX_CONTEXT_LENGTH,
-            "resume_from": RESUME_FROM,
+            "resume_from": resume_from,
             "eval_every_n_steps": EVAL_EVERY_N_STEPS,
             "eval_n_samples": EVAL_N_SAMPLES,
             "eval_tasks": EVAL_TASKS,
@@ -533,6 +258,7 @@ def main():
     gen_future = None  # Future for prefetched next-step generation
     last_sync_duration = None
     sync_interval = SYNC_EVERY_N_STEPS
+    sync_state = {"steps_since_decrease": 0}
 
     for epoch in range(n_epochs):
         all_batches = list(dataset.iter(batch_size=batch_size))
@@ -594,10 +320,6 @@ def main():
                     group_size, max_context, SHARED_VOCAB_SIZE,
                 )
 
-            # Print a decoded rollout to check if training data is coherent
-            if opt_step_idx < 2:
-                print(f"[opt_step {opt_step_idx}] Rollout sample: {tokenizer.decode(sequences[0].tolist()[:200])}")
-
             total_generated_tokens = 0
 
             # Flag sequences that hit max_length without EOS (vectorized)
@@ -616,7 +338,7 @@ def main():
             # splits output into MICRO_BATCH_SIZE chunks for student consumption.
             teacher_queue = Queue(maxsize=4)
             teacher_thread = teacher_executor.submit(
-                run_teacher_pipeline, teacher_compiled, sequences, attention_mask,
+                run_teacher_pipeline, teacher, sequences, attention_mask,
                 TEACHER_MICRO_BATCH_SIZE, TEACHER_DEVICE, STUDENT_DEVICE, teacher_queue,
                 MICRO_BATCH_SIZE
             )
@@ -639,19 +361,11 @@ def main():
 
                 student_mask = attention_mask[seq_start:seq_end].to(STUDENT_DEVICE, non_blocking=True)
 
-                student_out = student_compiled(
+                student_out = student(
                     input_ids=student_input,
                     attention_mask=student_mask,
                 )
                 current_logprobs = get_logprobs_at_tokens(student_out.logits, student_input, SHARED_VOCAB_SIZE)
-
-                # Gradient chain diagnostics (first 3 steps only)
-                if global_step < 3 and mb_idx == 0:
-                    print(f"--- Gradient diagnostics (step {global_step}) ---")
-                    print(f"logits.grad_fn: {student_out.logits.grad_fn}")
-                    print(f"logits.requires_grad: {student_out.logits.requires_grad}")
-                    print(f"current_logprobs.grad_fn: {current_logprobs.grad_fn}")
-                    print(f"loss_mask sum: {mb_loss_mask.sum().item()}")
 
                 ratio = torch.exp(current_logprobs - mb_old_lp)
                 clipped_ratio = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
@@ -659,14 +373,6 @@ def main():
                 pg_loss2 = -clipped_ratio * mb_advantage
                 per_token_loss = torch.max(pg_loss1, pg_loss2)
                 masked_loss = (per_token_loss * mb_loss_mask).sum() / mb_loss_mask.sum()
-
-                # Gradient chain diagnostics continued
-                if global_step < 3 and mb_idx == 0:
-                    ms = max(mb_loss_mask.sum().item(), 1)
-                    print(f"ratio mean (should be ~1): {(ratio * mb_loss_mask).sum().item() / ms:.6f}")
-                    print(f"masked_loss: {masked_loss.item():.6f}")
-                    print(f"masked_loss.grad_fn: {masked_loss.grad_fn}")
-                    print("---")
 
                 scaled_loss = masked_loss / n_micro_batches
                 scaled_loss.backward()
@@ -677,15 +383,6 @@ def main():
             teacher_thread.result()
 
             # --- Optimizer step (after all micro-batches) ---
-            # Verify gradients exist (first few steps, before zero_grad)
-            if global_step < 3:
-                has_grads = any(
-                    p.grad is not None
-                    for p in student.parameters()
-                    if p.requires_grad
-                )
-                print(f"Step {global_step + 1}: gradients exist = {has_grads}")
-
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 student.parameters(), max_norm=MAX_GRAD_NORM
             )
@@ -753,7 +450,7 @@ def main():
                 log_payload["train/sync_duration_sec"] = last_sync_duration
                 last_sync_duration = None
             sync_interval = get_sync_interval(
-                global_step, mean_ratio, approx_policy_drift, sync_interval
+                global_step, mean_ratio, approx_policy_drift, sync_interval, sync_state
             )
             log_payload["train/sync_every_n_steps"] = sync_interval
             wandb.log(log_payload)
@@ -802,6 +499,8 @@ def main():
                     tokenizer,
                     optimizer,
                     global_step,
+                    checkpoint_base,
+                    milestone_every,
                     hub_repo,
                 )
 
@@ -831,7 +530,8 @@ def main():
 
     # Final save (synchronous - we're done anyway)
     hub_repo = None if DEBUG_MODE else HUB_REPO
-    save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo)
+    save_checkpoint(student, tokenizer, optimizer, global_step,
+                    checkpoint_base, milestone_every, hub_repo)
 
     wandb.finish()
     print("Done!")

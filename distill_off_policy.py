@@ -19,6 +19,23 @@ import math
 from transformers import AutoTokenizer
 
 import wandb
+from distill_utils import (
+    DATASET,
+    TEACHER,
+    STUDENT,
+    HUB_REPO,
+    STUDENT_DEVICE,
+    BATCH_SIZE,
+    N_EPOCHS,
+    MICRO_BATCH_SIZE,
+    MAX_CONTEXT_LENGTH,
+    MAX_GRAD_NORM,
+    WARMUP_STEPS,
+    DEBUG_MODE,
+    build_loss_mask,
+    save_checkpoint,
+    load_checkpoint,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -26,31 +43,16 @@ torch.backends.cudnn.benchmark = True
 torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
-DATASET = "allenai/Dolci-Instruct-RL"
-TEACHER = "allenai/Olmo-3-7B-Instruct"
-STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
-HUB_REPO = None  # "hbfreed/Olmo-2-1B-Distilled"
 WANDB_PROJECT = "olmo-2-1b-off-policy-distillation"
 RUN_NAME = None
 
-STUDENT_DEVICE = "cuda:2"
 VLLM_DEVICES = ["cuda:0", "cuda:1"]  # two data-parallel teacher instances
 
-BATCH_SIZE = 1
-N_EPOCHS = 1
-MICRO_BATCH_SIZE = 2
 GRAD_ACCUM_STEPS = 64
-MAX_CONTEXT_LENGTH = 2048
 LR = 3e-5
 MIN_LR_RATIO = 0.1  # decay to 10% of peak LR
-MAX_GRAD_NORM = 3.0
-WARMUP_STEPS = 50
 DECAY_FRACTION = 0.2  # WSD: last 20% is cosine decay
-SWEEP_STEPS = None  # set via --sweep to stop early for LR comparison
 TEACHER_TOP_K = 128
-
-RESUME_FROM = "checkpoints/offpolicy-olmo3-7b-lr3e-5/latest"
-DEBUG_MODE = False
 
 torch.manual_seed(1223)
 
@@ -62,6 +64,15 @@ def parse_args():
                         help="Stop after N optimizer steps (for quick LR sweeps)")
     parser.add_argument("--wandb-run-id", type=str, default=None,
                         help="Wandb run ID to resume (e.g. xhzvc6kp)")
+    parser.add_argument("--checkpoint-base", type=str,
+                        default="checkpoints/offpolicy-olmo3-7b-lr3e-5",
+                        help="Base directory for checkpoints")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Checkpoint path to resume from")
+    parser.add_argument("--save-every", type=int, default=50,
+                        help="Save rolling checkpoint every N steps")
+    parser.add_argument("--milestone-every", type=int, default=500,
+                        help="Save permanent milestone checkpoint every N steps")
     return parser.parse_args()
 
 
@@ -150,86 +161,6 @@ def async_vllm_worker(gpu_id, model_name, cmd_q, result_q, ready_event):
         result_q.put(None)
 
     asyncio.run(run())
-
-
-
-def build_loss_mask(sequences, prompt_lens, pad_token_id):
-    """
-    Build a mask that's 1.0 for completion tokens, 0.0 for prompt and padding.
-
-    sequences: [batch, seq_len]
-    prompt_lens: list[int], length = batch (per-sequence prompt lengths)
-    pad_token_id: int
-
-    Returns: [batch, seq_len - 1] (shifted to match logprob indexing)
-    """
-    batch_size, seq_len = sequences.shape
-    positions = torch.arange(seq_len, device=sequences.device).unsqueeze(0)
-    prompt_lens_t = torch.tensor(prompt_lens, device=sequences.device).unsqueeze(1)
-    mask = (positions >= prompt_lens_t).float()
-    mask[sequences == pad_token_id] = 0.0
-    return mask[:, 1:]
-
-
-SAVE_EVERY = 500  # keep a milestone checkpoint every N steps
-CHECKPOINT_BASE = "checkpoints/offpolicy-olmo3-7b-lr3e-5"
-
-
-def save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo=None):
-    """Save rolling 'latest'/'prev' checkpoints, plus a permanent one every SAVE_EVERY steps."""
-    import shutil
-    latest_dir = f"{CHECKPOINT_BASE}/latest"
-    prev_dir = f"{CHECKPOINT_BASE}/prev"
-
-    # Rotate: latest -> prev (so we always have two recent checkpoints)
-    if os.path.exists(latest_dir):
-        if os.path.exists(prev_dir):
-            shutil.rmtree(prev_dir)
-        os.rename(latest_dir, prev_dir)
-
-    os.makedirs(latest_dir, exist_ok=True)
-    student.save_pretrained(latest_dir)
-    tokenizer.save_pretrained(latest_dir)
-    torch.save(
-        {"optimizer": optimizer.state_dict(), "step": global_step},
-        f"{latest_dir}/training_state.pt",
-    )
-    print(f"Saved latest checkpoint (step {global_step}) to {latest_dir}")
-
-    # Keep a permanent copy at milestones
-    if global_step % SAVE_EVERY == 0:
-        milestone_dir = f"{CHECKPOINT_BASE}/step_{global_step}"
-        os.makedirs(milestone_dir, exist_ok=True)
-        student.save_pretrained(milestone_dir)
-        tokenizer.save_pretrained(milestone_dir)
-        torch.save(
-            {"optimizer": optimizer.state_dict(), "step": global_step},
-            f"{milestone_dir}/training_state.pt",
-        )
-        print(f"Saved milestone checkpoint to {milestone_dir}")
-
-    if hub_repo:
-        try:
-            from huggingface_hub import HfApi
-            HfApi().upload_folder(
-                folder_path=latest_dir,
-                repo_id=hub_repo,
-                commit_message=f"Step {global_step}",
-                ignore_patterns=["training_state.pt"],
-            )
-            print(f"Pushed checkpoint to {hub_repo}")
-        except Exception as e:
-            print(f"Failed to push to hub: {e}")
-
-
-def load_checkpoint(checkpoint_path, student, optimizer):
-    """Load optimizer state and return the step to resume from."""
-    state_path = f"{checkpoint_path}/training_state.pt"
-    if os.path.exists(state_path):
-        state = torch.load(state_path, weights_only=False)
-        optimizer.load_state_dict(state["optimizer"])
-        return state["step"]
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +393,10 @@ def main():
     lr = args.lr
     sweep_steps = args.sweep
     wandb_run_id = args.wandb_run_id
+    checkpoint_base = args.checkpoint_base
+    resume_from = args.resume_from
+    save_every = args.save_every
+    milestone_every = args.milestone_every
 
     print(f"Loading tokenizer from {TEACHER}...")
     tokenizer = AutoTokenizer.from_pretrained(TEACHER)
@@ -490,7 +425,6 @@ def main():
 
     steps_per_epoch = len(dataset) // (batch_size * GRAD_ACCUM_STEPS)
     total_steps = steps_per_epoch * n_epochs
-    save_every = 50  # save rolling 'latest' every 50 steps; milestones at SAVE_EVERY
 
     # --- Spawn vLLM teacher workers (must happen before student touches CUDA) ---
     ctx = mp.get_context("spawn")
@@ -519,9 +453,9 @@ def main():
 
     # --- Load student model on its own GPU ---
     print(f"Loading student model from {STUDENT}...")
-    if RESUME_FROM:
+    if resume_from:
         student = AutoLigerKernelForCausalLM.from_pretrained(
-            RESUME_FROM,
+            resume_from,
             dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
         ).to(STUDENT_DEVICE)
@@ -543,7 +477,6 @@ def main():
         print(f"Vocab size: {STUDENT_VOCAB_SIZE}")
 
     student.gradient_checkpointing_enable()
-    student = torch.compile(student)
 
     optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8)
     warmup_steps = min(WARMUP_STEPS, total_steps // 5)
@@ -565,8 +498,8 @@ def main():
     print(f"WSD schedule: {warmup_steps} warmup, {stable_steps} stable, {decay_steps} decay")
 
     start_step = 0
-    if RESUME_FROM:
-        start_step = load_checkpoint(RESUME_FROM, student, optimizer)
+    if resume_from:
+        start_step = load_checkpoint(resume_from, student, optimizer)
         # Fast-forward scheduler to match resumed step
         for _ in range(start_step):
             scheduler.step()
@@ -599,7 +532,7 @@ def main():
             "max_grad_norm": MAX_GRAD_NORM,
             "warmup_steps": WARMUP_STEPS,
             "max_context_length": MAX_CONTEXT_LENGTH,
-            "resume_from": RESUME_FROM,
+            "resume_from": resume_from,
             "vllm_devices": VLLM_DEVICES,
             "sweep_steps": sweep_steps,
         },
@@ -645,10 +578,6 @@ def main():
                 prefetcher.get_next()
             )
 
-            if opt_step_idx < 2:
-                print(f"[opt_step {opt_step_idx}] Teacher completion sample: "
-                      f"{tokenizer.decode(sequences[0].tolist()[:200])}")
-
             # Flag sequences that hit max_length without EOS
             positions = torch.arange(sequences.shape[1]).unsqueeze(0)
             prompt_lens_t = torch.tensor(prompt_lens).unsqueeze(1)
@@ -693,32 +622,14 @@ def main():
                     -1, student_input[:, 1:].unsqueeze(-1)
                 ).squeeze(-1)
 
-                # Gradient diagnostics (first 3 steps)
-                if global_step < 3 and mb_idx == 0:
-                    print(f"--- Gradient diagnostics (step {global_step}) ---")
-                    print(f"logits.requires_grad: {student_out.logits.requires_grad}")
-                    print(f"per_token_kl mean: {per_token_kl.mean().item():.6f}")
-                    print(f"loss_mask sum: {mb_loss_mask.sum().item()}")
-
                 # Masked KL loss
                 masked_loss = (per_token_kl * mb_loss_mask).sum() / mb_loss_mask.sum()
-
-                if global_step < 3 and mb_idx == 0:
-                    print(f"masked_loss: {masked_loss.item():.6f}")
-                    print(f"masked_loss.grad_fn: {masked_loss.grad_fn}")
-                    print("---")
 
                 scaled_loss = masked_loss / n_micro_batches
                 scaled_loss.backward()
                 accumulated_loss += scaled_loss.item()
 
             # --- Optimizer step ---
-            if global_step < 3:
-                has_grads = any(
-                    p.grad is not None for p in student.parameters() if p.requires_grad
-                )
-                print(f"Step {global_step + 1}: gradients exist = {has_grads}")
-
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 student.parameters(), max_norm=MAX_GRAD_NORM
             )
@@ -770,7 +681,8 @@ def main():
                 if checkpoint_future is not None:
                     checkpoint_future.result()
                 checkpoint_future = checkpoint_executor.submit(
-                    save_checkpoint, student, tokenizer, optimizer, global_step, hub_repo,
+                    save_checkpoint, student, tokenizer, optimizer, global_step,
+                    checkpoint_base, milestone_every, hub_repo,
                 )
 
         if sweep_steps and global_step >= sweep_steps:
@@ -787,7 +699,8 @@ def main():
 
     # Final save
     hub_repo = None if DEBUG_MODE else HUB_REPO
-    save_checkpoint(student, tokenizer, optimizer, global_step, hub_repo)
+    save_checkpoint(student, tokenizer, optimizer, global_step,
+                    checkpoint_base, milestone_every, hub_repo)
 
     # Wait for vLLM worker processes to exit
     # (sender threads already sent shutdown sentinels via prefetcher.shutdown())

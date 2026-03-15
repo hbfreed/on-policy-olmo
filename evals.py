@@ -1,8 +1,9 @@
-"""Mid-training evaluation using lm-eval-harness with an existing vLLM engine."""
+"""Mid-training evaluation using lm-eval-harness with existing vLLM or HF models."""
 
 import os
 
 from lm_eval import simple_evaluate
+from lm_eval.models.huggingface import HFLM
 from lm_eval.models.vllm_causallms import VLLM
 from transformers import AutoConfig
 
@@ -37,6 +38,39 @@ class VLLMFromExisting(VLLM):
         self.hf_chat_template = None
         self.truncation_side = "left"
         self.V1 = os.environ.get("VLLM_USE_V1", "1") != "0"
+
+
+class HFFromExisting(HFLM):
+    """Inject existing HF model into lm-eval (skip HFLM.__init__ model loading)."""
+
+    def __init__(self, model, tokenizer, model_name):
+        # Call grandparent (TemplateLM -> LM) init, skipping HFLM.__init__
+        super(HFLM, self).__init__()
+
+        self._model = model
+        self.tokenizer = tokenizer
+        self._config = AutoConfig.from_pretrained(model_name)
+        self._device = model.device if hasattr(model, 'device') else next(model.parameters()).device
+
+        # Required HFLM attributes
+        self.backend = "causal"
+        self.batch_size_per_gpu = 1
+        self._max_length = None
+        self._max_gen_toks = 256
+        self.add_bos_token = False
+        self.custom_prefix_token_id = None
+        self.truncation = False
+        self.model_args = {"model": model_name}
+        self.chat_template_args = {}
+        self.hf_chat_template = None
+
+    @property
+    def model(self):
+        return self._model
+
+    @property
+    def device(self):
+        return self._device
 
 
 # Tasks that use lm-eval's built-in fewshot defaults
@@ -79,6 +113,36 @@ def run_evals(vllm_llm, tokenizer, model_name, tasks=None, limit=200):
             limit=limit,
             apply_chat_template=True,
             log_samples=False,
+        )
+        if results:
+            metrics.update(_extract_metrics(results))
+
+    return metrics
+
+
+def run_evals_hf(model, tokenizer, model_name, tasks=None, limit=200):
+    """Run lm-eval benchmarks with HF model. Same interface as run_evals."""
+    if tasks is None:
+        tasks = _DEFAULT_TASKS + list(_FEWSHOT_TASKS.keys())
+
+    wrapper = HFFromExisting(model, tokenizer, model_name)
+    metrics = {}
+
+    default_tasks = [t for t in tasks if t not in _FEWSHOT_TASKS]
+    fewshot_tasks = {t: _FEWSHOT_TASKS[t] for t in tasks if t in _FEWSHOT_TASKS}
+
+    if default_tasks:
+        results = simple_evaluate(
+            model=wrapper, tasks=default_tasks, limit=limit,
+            apply_chat_template=True, log_samples=False,
+        )
+        if results:
+            metrics.update(_extract_metrics(results))
+
+    for task, num_fewshot in fewshot_tasks.items():
+        results = simple_evaluate(
+            model=wrapper, tasks=[task], num_fewshot=num_fewshot,
+            limit=limit, apply_chat_template=True, log_samples=False,
         )
         if results:
             metrics.update(_extract_metrics(results))
