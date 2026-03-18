@@ -5,8 +5,8 @@
 # Usage: uv run bash launch_sft.sh {kld|cce} [extra args...]
 #
 # Examples:
-#   uv run bash launch_sft.sh cce --sweep 3 --grad-accum-steps 4 --pack-length 2048
-#   uv run bash launch_sft.sh kld --sweep 3 --grad-accum-steps 4 --pack-length 2048
+#   uv run bash launch_sft.sh cce --sweep 3 --total-batch-size 128 --pack-length 2048
+#   uv run bash launch_sft.sh kld --sweep 3 --total-batch-size 128 --pack-length 2048
 
 set -e
 

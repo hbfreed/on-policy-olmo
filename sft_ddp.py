@@ -3,21 +3,23 @@
 Two loss modes:
   - kld: Teacher (OLMo-3-7B-Instruct) provides soft targets via top-K logprobs,
          student minimizes partial forward KL. 1 HF teacher + 2 DDP students.
+         Teacher extraction is pipelined: step N+1 prefetched during step N's student work.
   - cce: Standard supervised fine-tuning using cut-cross-entropy (no teacher).
-         3 DDP students.
+         3 DDP students. lm_head hook avoids materializing full logits.
 
 GPU layout:
   KLD: GPU 0 = HF teacher, GPU 1..2 = DDP student ranks (nproc_per_node=2, offset=1)
   CCE: GPU 0..2 = DDP student ranks (nproc_per_node=3, offset=0)
 
 Usage:
-  uv run bash launch_sft.sh kld --sweep 3 --grad-accum-steps 4
-  uv run bash launch_sft.sh cce --sweep 3 --grad-accum-steps 4
+  uv run bash launch_sft.sh kld --sweep 3 --total-batch-size 128
+  uv run bash launch_sft.sh cce --sweep 3 --total-batch-size 128
 """
 
 import argparse
 import math
 import random
+import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -67,7 +69,8 @@ def parse_args():
     parser.add_argument("--micro-batch-size", type=int, default=2)
     parser.add_argument("--teacher-micro-batch-size", type=int, default=6,
                         help="Teacher sub-chunking (KLD only)")
-    parser.add_argument("--grad-accum-steps", type=int, default=32)
+    parser.add_argument("--total-batch-size", type=int, default=128,
+                        help="Target chunks per optimizer step (auto-rounded down to fit micro-batch-size * world_size)")
     parser.add_argument("--gpu-offset", type=int, default=None,
                         help="Rank i -> cuda:{i + offset}. Auto: 1 for KLD, 0 for CCE")
     parser.add_argument("--sweep", type=int, default=None,
@@ -76,6 +79,8 @@ def parse_args():
     parser.add_argument("--checkpoint-base", type=str, default=None)
     parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("--save-every", type=int, default=50)
+    parser.add_argument("--eval-every", type=int, default=None,
+                        help=f"Eval frequency (default: EVAL_EVERY_N_STEPS={EVAL_EVERY_N_STEPS})")
     parser.add_argument("--milestone-every", type=int, default=500)
     return parser.parse_args()
 
@@ -125,11 +130,11 @@ def extract_teacher_topk(teacher, batch_ids, batch_pad_mask, batch_pos_ids,
         top_lps_raw, top_ids = t_logits.topk(K, dim=-1)
         top_lps = top_lps_raw - t_lse.unsqueeze(-1)
 
-        all_top_ids.append(top_ids.cpu())
-        all_top_lps.append(top_lps.cpu())
+        all_top_ids.append(top_ids)
+        all_top_lps.append(top_lps)
         del t_out, t_logits, t_lse, top_lps_raw
 
-    return torch.cat(all_top_ids), torch.cat(all_top_lps)  # [N, T-1, K]
+    return torch.cat(all_top_ids), torch.cat(all_top_lps)  # [N, T-1, K] on teacher_device
 
 
 def main():
@@ -144,7 +149,7 @@ def main():
     pack_length = args.pack_length
     micro_batch_size = args.micro_batch_size
     teacher_micro_batch_size = args.teacher_micro_batch_size
-    grad_accum_steps = args.grad_accum_steps
+    total_batch_size = args.total_batch_size
     gpu_offset = args.gpu_offset if args.gpu_offset is not None else (1 if loss_type == "kld" else 0)
     sweep_steps = args.sweep
     wandb_run_id = args.wandb_run_id
@@ -160,8 +165,22 @@ def main():
     device = f"cuda:{rank + gpu_offset}"
     torch.cuda.set_device(device)
 
+    # Round total_batch_size to nearest multiple of micro_batch_size * world_size
+    unit = micro_batch_size * world_size
+    total_batch = round(total_batch_size / unit) * unit
+    assert total_batch > 0, (
+        f"total_batch_size ({total_batch_size}) too small for "
+        f"micro_batch_size ({micro_batch_size}) * world_size ({world_size}) = {unit}"
+    )
+    n_micro_batches = total_batch // micro_batch_size
+    mbs_per_rank = n_micro_batches // world_size
+
     if rank == 0:
+        if total_batch != total_batch_size:
+            print(f"Adjusted batch size: {total_batch_size} -> {total_batch} "
+                  f"(nearest multiple of {unit})")
         print(f"SFT mode: {loss_type.upper()}, DDP: {world_size} ranks, "
+              f"batch={total_batch} ({mbs_per_rank}x{micro_batch_size}/rank), "
               f"devices cuda:{gpu_offset}..cuda:{gpu_offset + world_size - 1}")
 
     # Tokenizer
@@ -235,7 +254,7 @@ def main():
     random.shuffle(chunk_order)
 
     n_epochs = N_EPOCHS
-    steps_per_epoch = n_chunks // grad_accum_steps
+    steps_per_epoch = n_chunks // total_batch
     total_steps = steps_per_epoch * n_epochs
 
     if rank == 0:
@@ -248,12 +267,24 @@ def main():
     student = AutoLigerKernelForCausalLM.from_pretrained(
         student_src, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
     ).to(device)
-    student.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
+    # NOTE: gradient checkpointing is a no-op with Liger kernels (fused ops
+    # bypass HF checkpointing hooks). Profiling confirmed identical memory
+    # and identical CUDA time with/without. Removed to avoid confusion.
     VOCAB_SIZE = student.config.vocab_size
 
-    student = DDP(student, device_ids=[rank + gpu_offset])
+    # CCE: capture last hidden state before lm_head, replace input with
+    # 1-token dummy so the expensive [B*T, H] @ [H, V] matmul is skipped.
+    # DDP still sees lm_head.weight as used; real gradients flow through
+    # linear_cross_entropy which takes hidden + weight directly.
+    _captured_hidden = [None]
+    if loss_type == "cce":
+        def _capture_pre_lm_head(module, args):
+            _captured_hidden[0] = args[0]
+            return (args[0][:, :1, :],)
+        student.lm_head.register_forward_pre_hook(_capture_pre_lm_head)
+
+    student = DDP(student, device_ids=[rank + gpu_offset],
+                  static_graph=True, broadcast_buffers=False)
 
     optimizer = bnb.optim.AdamW8bit(
         student.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8
@@ -312,7 +343,7 @@ def main():
             project=WANDB_PROJECT, id=wandb_run_id, name=run_name,
             config={
                 "loss_type": loss_type, "teacher": TEACHER, "student": STUDENT,
-                "pack_length": pack_length, "grad_accum_steps": grad_accum_steps,
+                "pack_length": pack_length, "total_batch": total_batch,
                 "micro_batch_size": micro_batch_size, "ddp_world_size": world_size,
                 "steps_per_epoch": steps_per_epoch, "n_epochs": n_epochs,
                 "total_steps": total_steps, "lr": lr, "sweep_steps": sweep_steps,
@@ -324,19 +355,36 @@ def main():
 
     # Training loop
     global_step = start_step
-    accumulated_loss = 0.0
+    _save_thread = None
     optimizer.zero_grad(set_to_none=True)
 
-    # Micro-batch sharding setup
-    n_micro_batches = grad_accum_steps // micro_batch_size
-    assert grad_accum_steps % micro_batch_size == 0, (
-        f"grad_accum_steps ({grad_accum_steps}) must be divisible by micro_batch_size ({micro_batch_size})"
-    )
-    assert n_micro_batches % world_size == 0, (
-        f"n_micro_batches ({n_micro_batches}) must be divisible by world_size ({world_size}). "
-        f"Adjust --micro-batch-size or --grad-accum-steps."
-    )
-    mbs_per_rank = n_micro_batches // world_size
+    # Micro-batch sharding (n_micro_batches, mbs_per_rank computed above)
+
+    # KLD: teacher stream for async prefetch (teacher on GPU 0, students on GPU 1+)
+    teacher_stream = None
+    _prefetched_teacher = None  # (top_ids, top_lps) on student device, ready for broadcast
+    if loss_type == "kld" and rank == 0:
+        teacher_stream = torch.cuda.Stream(device=teacher_device)
+
+    def _load_batch(step_idx):
+        """Load packed chunks from memmap for a given optimizer step."""
+        start = step_idx * total_batch
+        indices = chunk_order[start:start + total_batch]
+        return (
+            torch.from_numpy(packed_ids[indices].astype(np.int64)),
+            torch.from_numpy(packed_pos[indices].astype(np.int64)),
+            torch.from_numpy(packed_loss_mask[indices].astype(np.float32)),
+            torch.from_numpy(packed_pad_mask[indices].copy()),
+        )
+
+    def _teacher_extract_and_stage(batch_ids, batch_pad_mask, batch_pos_ids):
+        """Extract teacher top-K and move to rank 0's student device. Runs on teacher_stream."""
+        top_ids, top_lps = extract_teacher_topk(
+            teacher, batch_ids, batch_pad_mask, batch_pos_ids,
+            teacher_device, teacher_micro_batch_size, VOCAB_SIZE,
+        )
+        # Move from teacher_device (cuda:0) to rank 0's student device
+        return top_ids.to(device), top_lps.to(device)
 
     pbar = tqdm(total=total_steps - start_step, desc=f"SFT ({loss_type.upper()})",
                 disable=(rank != 0))
@@ -349,39 +397,51 @@ def main():
 
             opt_step_start = time.time()
 
-            # Gather grad_accum_steps packed chunks for this optimizer step
-            batch_start = opt_step_idx * grad_accum_steps
-            batch_indices = chunk_order[batch_start:batch_start + grad_accum_steps]
+            # Load batch from memmap
+            batch_ids, batch_pos_ids, batch_loss_mask, batch_pad_mask = _load_batch(opt_step_idx)
 
-            # Load from memmap -> torch tensors: [grad_accum_steps, pack_length]
-            batch_ids = torch.from_numpy(packed_ids[batch_indices].astype(np.int64))
-            batch_pos_ids = torch.from_numpy(packed_pos[batch_indices].astype(np.int64))
-            batch_loss_mask = torch.from_numpy(packed_loss_mask[batch_indices].astype(np.float32))
-            batch_pad_mask = torch.from_numpy(packed_pad_mask[batch_indices].copy())
-
-            # === KLD: teacher top-K extraction + broadcast ===
+            # === KLD: use prefetched teacher outputs or extract synchronously ===
             if loss_type == "kld":
-                if rank == 0:
-                    top_ids, top_lps = extract_teacher_topk(
-                        teacher, batch_ids, batch_pad_mask, batch_pos_ids,
-                        teacher_device, teacher_micro_batch_size, VOCAB_SIZE,
-                    )
+                if _prefetched_teacher is not None:
+                    # Wait for async teacher extraction to finish
+                    if rank == 0:
+                        teacher_stream.synchronize()
+                    top_ids, top_lps = _prefetched_teacher
+                    _prefetched_teacher = None
                 else:
-                    # Allocate receive buffers
-                    top_ids = torch.empty(grad_accum_steps, pack_length - 1, TEACHER_TOP_K,
-                                          dtype=torch.long)
-                    top_lps = torch.empty(grad_accum_steps, pack_length - 1, TEACHER_TOP_K,
-                                          dtype=torch.float32)
-                # Move to device for NCCL broadcast, then back to CPU
-                top_ids = top_ids.to(device)
-                top_lps = top_lps.to(device)
+                    # First step: extract synchronously
+                    if rank == 0:
+                        top_ids, top_lps = _teacher_extract_and_stage(
+                            batch_ids, batch_pad_mask, batch_pos_ids)
+                    else:
+                        top_ids = torch.empty(total_batch, pack_length - 1, TEACHER_TOP_K,
+                                              dtype=torch.long, device=device)
+                        top_lps = torch.empty(total_batch, pack_length - 1, TEACHER_TOP_K,
+                                              dtype=torch.float32, device=device)
                 dist.broadcast(top_ids, src=0)
                 dist.broadcast(top_lps, src=0)
-                top_ids = top_ids.cpu()
-                top_lps = top_lps.cpu()
+
+                # Prefetch teacher outputs for NEXT step (async, overlaps with student work)
+                next_step_idx = opt_step_idx + 1
+                if next_step_idx < steps_per_epoch and not (sweep_steps and global_step + 1 >= sweep_steps):
+                    next_ids, next_pos, _, next_pad = _load_batch(next_step_idx)
+                    if rank == 0:
+                        with torch.cuda.stream(teacher_stream):
+                            _pf_top_ids, _pf_top_lps = _teacher_extract_and_stage(
+                                next_ids, next_pad, next_pos)
+                        _prefetched_teacher = (_pf_top_ids, _pf_top_lps)
+                    else:
+                        # Rank 1+ pre-allocate receive buffers for next broadcast
+                        _prefetched_teacher = (
+                            torch.empty(total_batch, pack_length - 1, TEACHER_TOP_K,
+                                        dtype=torch.long, device=device),
+                            torch.empty(total_batch, pack_length - 1, TEACHER_TOP_K,
+                                        dtype=torch.float32, device=device),
+                        )
 
             # === Micro-batch loop ===
-            total_loss_tokens = 0.0
+            accumulated_loss_gpu = torch.zeros(1, device=device)
+            total_loss_tokens_gpu = torch.zeros(1, device=device)
             rank_start = rank * mbs_per_rank
 
             for local_idx in range(mbs_per_rank):
@@ -395,21 +455,22 @@ def main():
                 mb_loss_mask = batch_loss_mask[seq_start:seq_end].to(device, non_blocking=True)
 
                 if loss_type == "cce":
-                    # Forward through DDP to register backward hooks, get hidden states
+                    # Forward through DDP; pre-hook captures hidden state
+                    # and feeds 1-token dummy to lm_head (nearly free)
                     student_out = student(
                         input_ids=mb_ids, attention_mask=mb_pad_mask,
                         position_ids=mb_pos_ids,
-                        output_hidden_states=True,
                     )
-                    hidden = student_out.hidden_states[-1]
-                    del student_out  # free logits + intermediate hidden states
+                    hidden = _captured_hidden[0]
+                    _captured_hidden[0] = None
+                    del student_out
 
-                    # Shifted: hidden[:, :-1] predicts labels[:, 1:]
-                    labels = mb_ids[:, 1:].contiguous()
+                    # CCE handles shift internally, avoids .contiguous() copies
                     per_token_loss = linear_cross_entropy(
-                        hidden[:, :-1, :].contiguous(),
+                        hidden,
                         student.module.lm_head.weight,
-                        labels,
+                        mb_ids,
+                        shift=True,
                         reduction="none",
                     )  # [B, T-1]
 
@@ -423,8 +484,8 @@ def main():
                     )
                     # Shift student logits to align with teacher's shifted top-K
                     s_logits = student_out.logits[:, :-1, :VOCAB_SIZE]
-                    mb_top_ids = top_ids[seq_start:seq_end].to(device, non_blocking=True)
-                    mb_top_lps = top_lps[seq_start:seq_end].to(device, non_blocking=True)
+                    mb_top_ids = top_ids[seq_start:seq_end]
+                    mb_top_lps = top_lps[seq_start:seq_end]
                     combined_mask = mb_loss_mask[:, 1:] * mb_pad_mask[:, 1:].float()
 
                     masked_loss = fused_partial_kl(
@@ -435,8 +496,8 @@ def main():
                 ctx = nullcontext() if (local_idx == mbs_per_rank - 1) else student.no_sync()
                 with ctx:
                     scaled_loss.backward()
-                accumulated_loss += scaled_loss.item()
-                total_loss_tokens += (mb_loss_mask[:, 1:] * mb_pad_mask[:, 1:].float()).sum().item()
+                accumulated_loss_gpu += scaled_loss.detach()
+                total_loss_tokens_gpu += (mb_loss_mask[:, 1:] * mb_pad_mask[:, 1:].float()).sum()
 
             # Optimizer step
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -446,25 +507,25 @@ def main():
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-            # Logging (rank 0)
+            # Logging (rank 0) — single .item() call instead of per-micro-batch
             if rank == 0:
                 opt_step_time = time.time() - opt_step_start
                 log_payload = {
-                    "train/loss": accumulated_loss,
+                    "train/loss": accumulated_loss_gpu.item(),
                     "train/grad_norm": grad_norm.item(),
                     "train/learning_rate": scheduler.get_last_lr()[0],
                     "train/optimizer_step_time_sec": opt_step_time,
                     "train/global_step": global_step,
-                    "train/loss_tokens": total_loss_tokens,
+                    "train/loss_tokens": total_loss_tokens_gpu.item(),
                 }
                 wandb.log(log_payload)
 
-            accumulated_loss = 0.0
             global_step += 1
             pbar.update(1)
 
             # Eval (rank 0)
-            if rank == 0 and global_step % EVAL_EVERY_N_STEPS == 0:
+            eval_every = args.eval_every or EVAL_EVERY_N_STEPS
+            if rank == 0 and global_step % eval_every == 0:
                 student.eval()
                 metrics = run_evals_hf(
                     student.module, tokenizer, STUDENT,
@@ -473,10 +534,20 @@ def main():
                 wandb.log(metrics)
                 student.train()
 
-            # Checkpoint (rank 0)
+            # Checkpoint (rank 0, async — snapshot state to CPU, write in background)
             if rank == 0 and global_step % save_every == 0:
-                save_checkpoint(student.module, tokenizer, optimizer,
-                                global_step, checkpoint_base, milestone_every)
+                if _save_thread is not None and _save_thread.is_alive():
+                    _save_thread.join()
+                _snap_state = {k: v.cpu() for k, v in student.module.state_dict().items()}
+                _snap_opt = {"optimizer": optimizer.state_dict(), "step": global_step}
+                _snap_step = global_step
+                def _bg_save(state, opt, step):
+                    save_checkpoint(student.module, tokenizer, optimizer,
+                                    step, checkpoint_base, milestone_every,
+                                    state_dict_cpu=state, opt_state=opt)
+                _save_thread = threading.Thread(
+                    target=_bg_save, args=(_snap_state, _snap_opt, _snap_step), daemon=True)
+                _save_thread.start()
 
             if sweep_steps and global_step >= sweep_steps:
                 if rank == 0:
@@ -490,6 +561,8 @@ def main():
 
     # Final save + cleanup
     if rank == 0:
+        if _save_thread is not None and _save_thread.is_alive():
+            _save_thread.join()
         save_checkpoint(student.module, tokenizer, optimizer,
                         global_step, checkpoint_base, milestone_every)
         wandb.finish()

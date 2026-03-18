@@ -373,8 +373,13 @@ def generate_samples(vllm_student, eval_prompts, tokenizer, max_context_length=4
 
 
 def save_checkpoint(student, tokenizer, optimizer, global_step,
-                    checkpoint_base, milestone_every=500, hub_repo=None):
-    """Save rolling 'latest'/'prev' checkpoints, plus a permanent one every milestone_every steps."""
+                    checkpoint_base, milestone_every=500, hub_repo=None,
+                    state_dict_cpu=None, opt_state=None):
+    """Save rolling 'latest'/'prev' checkpoints, plus a permanent one every milestone_every steps.
+
+    If state_dict_cpu/opt_state are provided, saves from those (for async bg saves).
+    Otherwise snapshots from the live model/optimizer.
+    """
     latest_dir = f"{checkpoint_base}/latest"
     prev_dir = f"{checkpoint_base}/prev"
 
@@ -385,23 +390,30 @@ def save_checkpoint(student, tokenizer, optimizer, global_step,
         os.rename(latest_dir, prev_dir)
 
     os.makedirs(latest_dir, exist_ok=True)
-    student.save_pretrained(latest_dir)
+    if state_dict_cpu is not None:
+        # Save from pre-snapshotted CPU state (async path)
+        from safetensors.torch import save_file
+        student.config.save_pretrained(latest_dir)
+        save_file(state_dict_cpu, f"{latest_dir}/model.safetensors")
+    else:
+        student.save_pretrained(latest_dir)
     tokenizer.save_pretrained(latest_dir)
-    torch.save(
-        {"optimizer": optimizer.state_dict(), "step": global_step},
-        f"{latest_dir}/training_state.pt",
-    )
+    _opt = opt_state if opt_state is not None else {"optimizer": optimizer.state_dict(), "step": global_step}
+    torch.save(_opt, f"{latest_dir}/training_state.pt")
     print(f"Saved latest checkpoint (step {global_step}) to {latest_dir}")
 
     if milestone_every > 0 and global_step % milestone_every == 0:
         milestone_dir = f"{checkpoint_base}/step_{global_step}"
-        os.makedirs(milestone_dir, exist_ok=True)
-        student.save_pretrained(milestone_dir)
-        tokenizer.save_pretrained(milestone_dir)
-        torch.save(
-            {"optimizer": optimizer.state_dict(), "step": global_step},
-            f"{milestone_dir}/training_state.pt",
-        )
+        if state_dict_cpu is not None:
+            shutil.copytree(latest_dir, milestone_dir)
+        else:
+            os.makedirs(milestone_dir, exist_ok=True)
+            student.save_pretrained(milestone_dir)
+            tokenizer.save_pretrained(milestone_dir)
+            torch.save(
+                {"optimizer": optimizer.state_dict(), "step": global_step},
+                f"{milestone_dir}/training_state.pt",
+            )
         print(f"Saved milestone checkpoint to {milestone_dir}")
 
     if hub_repo:
