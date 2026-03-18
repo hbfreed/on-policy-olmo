@@ -366,10 +366,18 @@ def main():
     if loss_type == "kld" and rank == 0:
         teacher_stream = torch.cuda.Stream(device=teacher_device)
 
-    def _load_batch(step_idx):
-        """Load packed chunks from memmap for a given optimizer step."""
+    def _load_batch(step_idx, rank_local=False):
+        """Load packed chunks from memmap for a given optimizer step.
+
+        If rank_local=True, loads only this rank's shard (mbs_per_rank * micro_batch_size chunks).
+        """
         start = step_idx * total_batch
-        indices = chunk_order[start:start + total_batch]
+        if rank_local:
+            start += rank * mbs_per_rank * micro_batch_size
+            count = mbs_per_rank * micro_batch_size
+        else:
+            count = total_batch
+        indices = chunk_order[start:start + count]
         return (
             torch.from_numpy(packed_ids[indices].astype(np.int64)),
             torch.from_numpy(packed_pos[indices].astype(np.int64)),
@@ -397,8 +405,17 @@ def main():
 
             opt_step_start = time.time()
 
-            # Load batch from memmap
-            batch_ids, batch_pos_ids, batch_loss_mask, batch_pad_mask = _load_batch(opt_step_idx)
+            # Load batch from memmap (rank-local for CCE, full for KLD rank 0)
+            if loss_type == "cce":
+                batch_ids, batch_pos_ids, batch_loss_mask, batch_pad_mask = _load_batch(
+                    opt_step_idx, rank_local=True)
+            elif rank == 0:
+                # KLD rank 0: full batch for teacher, will slice for student later
+                batch_ids, batch_pos_ids, batch_loss_mask, batch_pad_mask = _load_batch(opt_step_idx)
+            else:
+                # KLD rank 1+: only need own shard
+                batch_ids, batch_pos_ids, batch_loss_mask, batch_pad_mask = _load_batch(
+                    opt_step_idx, rank_local=True)
 
             # === KLD: use prefetched teacher outputs or extract synchronously ===
             if loss_type == "kld":
@@ -442,11 +459,12 @@ def main():
             # === Micro-batch loop ===
             accumulated_loss_gpu = torch.zeros(1, device=device)
             total_loss_tokens_gpu = torch.zeros(1, device=device)
-            rank_start = rank * mbs_per_rank
+            # batch_ids is rank-local (CCE, KLD non-rank-0) or full (KLD rank 0)
+            rank_local_batch = (loss_type == "cce") or (loss_type == "kld" and rank != 0)
+            batch_offset = 0 if rank_local_batch else rank * mbs_per_rank * micro_batch_size
 
             for local_idx in range(mbs_per_rank):
-                mb_idx = rank_start + local_idx
-                seq_start = mb_idx * micro_batch_size
+                seq_start = batch_offset + local_idx * micro_batch_size
                 seq_end = seq_start + micro_batch_size
 
                 mb_ids = batch_ids[seq_start:seq_end].to(device, non_blocking=True)
@@ -484,8 +502,10 @@ def main():
                     )
                     # Shift student logits to align with teacher's shifted top-K
                     s_logits = student_out.logits[:, :-1, :VOCAB_SIZE]
-                    mb_top_ids = top_ids[seq_start:seq_end]
-                    mb_top_lps = top_lps[seq_start:seq_end]
+                    # top_ids/top_lps are always full batch (from broadcast), use global index
+                    global_seq_start = (rank * mbs_per_rank + local_idx) * micro_batch_size
+                    mb_top_ids = top_ids[global_seq_start:global_seq_start + micro_batch_size]
+                    mb_top_lps = top_lps[global_seq_start:global_seq_start + micro_batch_size]
                     combined_mask = mb_loss_mask[:, 1:] * mb_pad_mask[:, 1:].float()
 
                     masked_loss = fused_partial_kl(
