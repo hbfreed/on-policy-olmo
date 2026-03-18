@@ -63,6 +63,7 @@ class HFFromExisting(HFLM):
         self.model_args = {"model": model_name}
         self.chat_template_args = {}
         self.hf_chat_template = None
+        self.mixed_precision_dtype = None
 
     @property
     def model(self):
