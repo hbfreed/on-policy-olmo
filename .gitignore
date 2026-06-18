@@ -55,3 +55,6 @@ artifacts/
 # OS
 .DS_Store
 Thumbs.db
+
+# Built flash-attn wheel (machine-specific, see pyproject [tool.uv.sources])
+wheels/
