@@ -25,7 +25,6 @@ from distill_utils import (
     run_teacher_pipeline_hidden,
     save_checkpoint,
     timed_generate_rollouts,
-    timed_sync_weights_to_vllm,
     timed_sync_weights_to_vllm_native,
 )
 from evals import run_evals
@@ -289,7 +288,7 @@ def main():
 
     start_step = 0
     if resume_from:
-        start_step = load_checkpoint(resume_from, student, optimizer, vllm_student)
+        start_step = load_checkpoint(resume_from, student, optimizer)
         for _ in range(start_step):
             scheduler.step()
         print(f"Resuming from step {start_step}, lr={scheduler.get_last_lr()[0]:.2e}")
@@ -361,6 +360,9 @@ def main():
     # Native NCCL weight transfer: HF student (STUDENT_DEVICE) -> vLLM worker (VLLM_DEVICE).
     # Direct GPU->GPU broadcast replacing the BytesIO/collective_rpc sync.
     weight_transfer_group = init_weight_transfer(student, vllm_student, STUDENT_DEVICE)
+    # Push current weights once at startup (covers --resume-from; a no-op on a fresh
+    # start since vLLM already loaded the same checkpoint).
+    timed_sync_weights_to_vllm_native(student, vllm_student, weight_transfer_group, STUDENT_DEVICE)
 
     # Use a single-threaded executor to serialize all vLLM calls (generate/sync)
     vllm_executor = ThreadPoolExecutor(max_workers=1)

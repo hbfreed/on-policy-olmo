@@ -1,12 +1,10 @@
 """Shared functions for distillation scripts. Configs live in each script."""
 
-import io
 import os
 import shutil
 import threading
 import time
 
-import cloudpickle
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -602,52 +600,25 @@ def save_checkpoint(student, tokenizer, optimizer, global_step,
             print(f"Failed to push to hub: {e}")
 
 
-def load_checkpoint(checkpoint_path, student, optimizer, vllm_student=None):
-    """Load optimizer state and return the step to resume from."""
+def load_checkpoint(checkpoint_path, student, optimizer):
+    """Load optimizer state and return the step to resume from.
+
+    Weight sync to vLLM is handled separately via the native NCCL path once the
+    transfer group exists (see init_weight_transfer / sync_weights_to_vllm_native).
+    """
     state_path = f"{checkpoint_path}/training_state.pt"
     if os.path.exists(state_path):
         state = torch.load(state_path, weights_only=False)
         optimizer.load_state_dict(state["optimizer"])
-        # Sync loaded weights to vLLM engine
-        if vllm_student is not None:
-            sync_weights_to_vllm(student, vllm_student)
         return state["step"]
     return 0
-
-
-def sync_weights_to_vllm(hf_model, vllm_llm):
-    """Sync weights from HF model to vLLM engine for on-policy learning.
-
-    Uses collective_rpc to update weights in V1 architecture.
-    See: https://github.com/vllm-project/vllm/issues/5723
-    """
-    hf_state_dict = {k: v.cpu() for k, v in hf_model.state_dict().items()}
-    buffer = io.BytesIO()
-    torch.save(hf_state_dict, buffer)
-    weights_bytes = buffer.getvalue()
-
-    def load_weights_on_worker(worker, serialized_weights):
-        buf = io.BytesIO(serialized_weights)
-        weights_dict = torch.load(buf, weights_only=True)
-        weights = list(weights_dict.items())
-        worker.model_runner.model.load_weights(weights=weights)
-
-    method_bytes = cloudpickle.dumps(load_weights_on_worker)
-    vllm_llm.llm_engine.collective_rpc(method_bytes, args=(weights_bytes,))
-
-
-def timed_sync_weights_to_vllm(hf_model, vllm_llm):
-    """Time sync to help pick a data-driven SYNC_EVERY_N_STEPS."""
-    start = time.time()
-    sync_weights_to_vllm(hf_model, vllm_llm)
-    return time.time() - start
 
 
 def init_weight_transfer(hf_model, vllm_llm, student_device,
                          master_addr="127.0.0.1", master_port=29512):
     """Set up vLLM's native NCCL weight-transfer group (trainer <-> vLLM worker).
 
-    Replaces the BytesIO/collective_rpc transport (sync_weights_to_vllm) with a direct
+    Replaces the old BytesIO/collective_rpc transport with a direct
     GPU->GPU NCCL broadcast. The HF trainer is rank 0, the single vLLM worker (TP=1) is
     rank 1; both rendezvous through a StatelessProcessGroup, so the two init calls must
     run concurrently (the trainer side blocks until the worker joins) -- hence the thread.
@@ -683,7 +654,7 @@ def init_weight_transfer(hf_model, vllm_llm, student_device,
 def sync_weights_to_vllm_native(hf_model, vllm_llm, weight_transfer_group, student_device):
     """GPU->GPU NCCL broadcast of HF student weights to the vLLM worker.
 
-    No CPU round-trip or pickling (cf. sync_weights_to_vllm). The worker's update_weights
+    No CPU round-trip or pickling (unlike the old BytesIO path). The worker's update_weights
     blocks receiving on the NCCL group, so it runs in a thread while the trainer broadcasts
     each tensor concurrently. Requires a prior init_weight_transfer.
     """
@@ -721,7 +692,7 @@ def sync_weights_to_vllm_native(hf_model, vllm_llm, weight_transfer_group, stude
 
 
 def timed_sync_weights_to_vllm_native(hf_model, vllm_llm, weight_transfer_group, student_device):
-    """Native NCCL sync with timing (drop-in for timed_sync_weights_to_vllm)."""
+    """Native NCCL sync with timing."""
     start = time.time()
     sync_weights_to_vllm_native(hf_model, vllm_llm, weight_transfer_group, student_device)
     return time.time() - start
