@@ -14,8 +14,8 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from distill_utils import SFT_DATASET, TEACHER, pack_sequences
-from sft_ddp import tokenize_and_filter
+from distill_utils import pack_sequences
+from sft_ddp import SFT_DATASET, TEACHER, tokenize_and_filter
 
 
 def main():

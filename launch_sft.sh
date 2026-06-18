@@ -29,8 +29,8 @@ python prepare_sft_data.py --pack-length "$PACK_LENGTH"
 
 # Stage 2: Wait for GPUs to be free
 if [ "$LOSS_TYPE" = "kld" ]; then
-    NPROC=2
-    NEEDED_GPUS="0,1,2"  # GPU 0 = teacher, GPU 1,2 = students
+    NPROC=3
+    NEEDED_GPUS="0,1,2"  # 3 DDP students, teacher logprobs pre-extracted
 else
     NPROC=3
     NEEDED_GPUS="0,1,2"

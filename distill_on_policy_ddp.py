@@ -31,28 +31,6 @@ from vllm import LLM
 
 import wandb
 from distill_utils import (
-    BATCH_SIZE,
-    CLIP_EPS,
-    DATASET,
-    DEBUG_MODE,
-    EVAL_EVERY_N_STEPS,
-    EVAL_N_SAMPLES,
-    EVAL_TASKS,
-    GRAD_ACCUM_STEPS,
-    GROUP_SIZE,
-    HUB_REPO,
-    LR,
-    MAX_CONTEXT_LENGTH,
-    MAX_GRAD_NORM,
-    N_EPOCHS,
-    N_SAMPLE_PROMPTS,
-    RUN_NAME,
-    SAMPLE_EVERY_N_STEPS,
-    STUDENT,
-    SYNC_EVERY_N_STEPS,
-    TEACHER,
-    WANDB_PROJECT,
-    WARMUP_STEPS,
     build_loss_mask,
     generate_rollouts,
     generate_samples,
@@ -67,8 +45,42 @@ from distill_utils import (
 )
 from evals import run_evals
 
+# ============================================================
+# Config
+# ============================================================
+
+WANDB_PROJECT = "olmo-2-1b-on-policy-distillation"
+RUN_NAME = None
+HUB_REPO = None
+
+# Models / data
+TEACHER = "allenai/Olmo-3-7B-Instruct"
+STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
+DATASET = "allenai/Dolci-Instruct-RL"
+
+# Devices
 TEACHER_DEVICE = "cuda:1"
 DDP_GPU_OFFSET = 2  # rank i -> cuda:{i + DDP_GPU_OFFSET}
+
+# Training (legacy PG-shaped path)
+LR = 1e-5
+N_EPOCHS = 1
+BATCH_SIZE = 1
+GROUP_SIZE = 4
+GRAD_ACCUM_STEPS = 256
+MAX_CONTEXT_LENGTH = 2048
+MAX_GRAD_NORM = 3.0
+WARMUP_STEPS = 50
+CLIP_EPS = 0.2
+SYNC_EVERY_N_STEPS = 1
+
+# Eval / logging
+DEBUG_MODE = False
+N_SAMPLE_PROMPTS = 4
+SAMPLE_EVERY_N_STEPS = 50
+EVAL_EVERY_N_STEPS = 50
+EVAL_N_SAMPLES = 200
+EVAL_TASKS = ["gsm8k_cot", "arc_easy", "truthfulqa_mc2", "ifeval"]
 
 
 def broadcast_rollout_data(rank, world_size, device, sequences, attention_mask,

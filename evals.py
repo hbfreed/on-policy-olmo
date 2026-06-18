@@ -64,6 +64,8 @@ class HFFromExisting(HFLM):
         self.chat_template_args = {}
         self.hf_chat_template = None
         self.mixed_precision_dtype = None
+        self.think_end_token = None
+        self.enable_thinking = False
 
     @property
     def model(self):

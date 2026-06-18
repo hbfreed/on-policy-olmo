@@ -47,6 +47,10 @@ data_cache/
 outputs/
 logs/
 wandb/
+artifacts/
+
+# Tooling
+.codex/
 
 # OS
 .DS_Store

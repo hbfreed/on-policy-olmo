@@ -11,13 +11,8 @@ LONG_BENCHMARKS="drop,minerva_math,mmlu"
 
 MODELS=(
     "allenai/OLMo-2-0425-1B-Instruct"
-    "checkpoints/offpolicy-7b-lr3e-5/latest"
-    "checkpoints/offpolicy-olmo3-7b/latest"
-    "checkpoints/offpolicy-olmo3-7b/prev"
-    "checkpoints/offpolicy-olmo3-7b-lr3e-5/latest"
-    "checkpoints/offpolicy-olmo3-7b-lr3e-5/prev"
-    "checkpoints/onpolicy/latest"
-    "checkpoints/onpolicy/prev"
+    "checkpoints/sft-cce/latest"
+    "checkpoints/sft-kld/latest"
 )
 
 log_name() {

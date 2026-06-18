@@ -1,4 +1,4 @@
-"""Shared utilities for distillation scripts."""
+"""Shared functions for distillation scripts. Configs live in each script."""
 
 import io
 import os
@@ -12,44 +12,9 @@ from tqdm import tqdm
 
 import wandb
 
-# --- Model & dataset constants ---
-DATASET = "allenai/Dolci-Instruct-RL"
-TEACHER = "allenai/Olmo-3-7B-Instruct"
-STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
-HUB_REPO = None  # "hbfreed/Olmo-2-1B-Distilled"
-WANDB_PROJECT = "olmo-2-1b-on-policy-distillation"
-RUN_NAME = None  # set to a string to override auto naming
-
-# --- Device layout ---
-STUDENT_DEVICE = "cuda:2"  # HF student for training
-TEACHER_DEVICE = "cuda:1"  # HF teacher for inference
-VLLM_DEVICE = "cuda:0"  # vLLM student for fast generation
-
-# --- Training hyperparameters ---
-BATCH_SIZE = 1
-N_EPOCHS = 1
-GROUP_SIZE = 4  # number of rollouts per prompt
-MICRO_BATCH_SIZE = 2  # sequences per student/teacher forward pass
-TEACHER_MICRO_BATCH_SIZE = 6
-GRAD_ACCUM_STEPS = 256
-MAX_CONTEXT_LENGTH = 2048
-LR = 1e-5
-CLIP_EPS = 0.2
-MAX_GRAD_NORM = 3.0
-WARMUP_STEPS = 50
-SYNC_EVERY_N_STEPS = 4
+# Adaptive sync bounds — used by get_sync_interval (legacy PG-shaped path).
 SYNC_MIN = 1
-SYNC_MAX = 4
-
-# --- Eval & logging ---
-DEBUG_MODE = False
-N_SAMPLE_PROMPTS = 4
-SAMPLE_EVERY_N_STEPS = 50
-EVAL_EVERY_N_STEPS = 50
-EVAL_N_SAMPLES = 200
-EVAL_TASKS = ["gsm8k_cot", "arc_easy", "truthfulqa_mc2", "ifeval"]
-TEACHER_TOP_K = 128
-SFT_DATASET = "allenai/Dolci-Instruct-SFT"
+SYNC_MAX = 1
 
 
 def pack_sequences(dataset, pack_length, pad_token_id, save_path=None):
@@ -194,18 +159,28 @@ def get_sync_interval(step, mean_ratio, approx_drift, current_interval, sync_sta
     return current_interval
 
 
-def get_logprobs_at_tokens(logits, tokens, vocab_size=None):
+def get_logprobs_at_tokens(logits, tokens, vocab_size=None, inplace=False):
     if vocab_size is not None:
         logits = logits[:, :, :vocab_size]
-    # Use F.cross_entropy which fuses log_softmax + gather internally,
-    # avoiding materializing the full [B, T, V] log_softmax tensor (~1.5 GiB).
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = tokens[:, 1:].contiguous()
     B, T, V = shift_logits.shape
-    return -F.cross_entropy(
-        shift_logits.view(B * T, V), shift_labels.view(B * T),
-        reduction="none",
-    ).view(B, T)
+
+    if inplace:
+        # In-place bf16 logsumexp: reuses logits memory instead of allocating
+        # a new [B*T, V] tensor. Only safe under inference_mode() (teacher path).
+        flat = shift_logits.view(B * T, V)
+        target = flat.gather(1, shift_labels.view(B * T, 1)).squeeze(1)
+        max_val = flat.max(dim=1, keepdim=True).values
+        flat -= max_val
+        flat.exp_()
+        lse = flat.sum(dim=1).float().log() + max_val.squeeze(1).float()
+        return (target.float() - lse).to(shift_logits.dtype).view(B, T)
+    else:
+        return -F.cross_entropy(
+            shift_logits.view(B * T, V), shift_labels.view(B * T),
+            reduction="none",
+        ).view(B, T)
 
 
 def run_teacher_pipeline(teacher, sequences, attention_mask, chunk_size,
@@ -217,32 +192,34 @@ def run_teacher_pipeline(teacher, sequences, attention_mask, chunk_size,
     if consumer_chunk_size is None:
         consumer_chunk_size = chunk_size
     try:
-        buffer = []
-        buffered_rows = 0
+        carry = None
         for i in range(0, len(sequences), chunk_size):
             chunk_seq = sequences[i:i + chunk_size].to(device, non_blocking=True)
             chunk_mask = attention_mask[i:i + chunk_size].to(device, non_blocking=True)
             try:
-                with torch.inference_mode():
+                with torch.inference_mode(), torch.cuda.device(device):
                     t_out = teacher(input_ids=chunk_seq, attention_mask=chunk_mask)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 raise RuntimeError(
-                    f"Teacher OOM with batch_size={chunk_seq.shape[0]}, "
-                    f"seq_len={chunk_seq.shape[1]}. Reduce TEACHER_MICRO_BATCH_SIZE "
-                    f"(currently {chunk_size})."
+                        f"Teacher OOM with batch_size={chunk_seq.shape[0]}, "
+                        f"seq_len={chunk_seq.shape[1]}. Reduce TEACHER_MICRO_BATCH_SIZE "
+                        f"(currently {chunk_size})."
                 )
-            logprobs = get_logprobs_at_tokens(t_out.logits, chunk_seq)
+            logprobs = get_logprobs_at_tokens(t_out.logits, chunk_seq, inplace=True)
             logprobs = logprobs.to(student_device).detach()
-            buffer.append(logprobs)
-            buffered_rows += logprobs.shape[0]
-            # Emit complete consumer-sized chunks from buffer
-            while buffered_rows >= consumer_chunk_size:
-                combined = torch.cat(buffer, dim=0)
-                queue.put(combined[:consumer_chunk_size])
-                remainder = combined[consumer_chunk_size:]
-                buffer = [remainder] if remainder.shape[0] > 0 else []
-                buffered_rows = remainder.shape[0]
+
+            if carry is not None:
+                logprobs = torch.cat((carry, logprobs), dim=0)
+                carry = None
+
+            emitted_rows = 0
+            while emitted_rows + consumer_chunk_size <= logprobs.shape[0]:
+                queue.put(logprobs[emitted_rows:emitted_rows + consumer_chunk_size])
+                emitted_rows += consumer_chunk_size
+
+            if emitted_rows < logprobs.shape[0]:
+                carry = logprobs[emitted_rows:]
         # Drop any leftover rows that don't fill a complete consumer chunk
         # (student loop only processes n_sequences // consumer_chunk_size chunks)
         queue.put(None)  # sentinel
@@ -251,10 +228,130 @@ def run_teacher_pipeline(teacher, sequences, attention_mask, chunk_size,
         raise
 
 
+class HiddenCapture:
+    """Capture lm_head input via forward pre-hook; short-circuit lm_head with a 1-token dummy.
+
+    Avoids the [B,T,V] lm_head matmul + logits allocation when the caller only needs the
+    final hidden state (e.g. to feed a fused-linear distillation kernel). The dummy output
+    is discarded by the caller; the captured hidden lives on `self.hidden`.
+    """
+
+    def __init__(self, model):
+        self.hidden = None
+        self.dummy = None
+        self._handle = model.lm_head.register_forward_pre_hook(self._pre)
+
+    def _pre(self, module, args):
+        x = args[0]
+        self.hidden = x
+        if (self.dummy is None
+                or self.dummy.shape[0] != x.shape[0]
+                or self.dummy.shape[2] != x.shape[2]
+                or self.dummy.dtype != x.dtype):
+            self.dummy = x.new_zeros(x.shape[0], 1, x.shape[2])
+        return (self.dummy,) + args[1:]
+
+    def close(self):
+        self._handle.remove()
+
+
+def active_lengths_from_attention(attention_mask):
+    """Return the last non-pad position + 1 for each row."""
+    if attention_mask.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=attention_mask.device)
+    positions = torch.arange(
+        attention_mask.shape[1],
+        device=attention_mask.device,
+        dtype=torch.long,
+    ).unsqueeze(0)
+    return torch.where(attention_mask.bool(), positions + 1, 0).max(dim=1).values
+
+
+def _pad_seq_dim(tensor, target_len):
+    if tensor.shape[1] == target_len:
+        return tensor
+    if tensor.shape[1] > target_len:
+        return tensor[:, :target_len]
+    if tensor.dim() == 2:
+        pad = tensor.new_zeros(tensor.shape[0], target_len - tensor.shape[1])
+    else:
+        pad = tensor.new_zeros(
+            tensor.shape[0], target_len - tensor.shape[1], *tensor.shape[2:]
+        )
+    return torch.cat((tensor, pad), dim=1)
+
+
+def run_teacher_pipeline_hidden(teacher, sequences, attention_mask, chunk_size,
+                                device, student_device, queue, consumer_chunk_size=None):
+    """Producer: run teacher forward in chunks, ship last hidden state (post-norm).
+
+    Uses HiddenCapture on lm_head to avoid materializing teacher logits. Buffers across
+    teacher chunks to handle non-aligned consumer sizes.
+    """
+    if consumer_chunk_size is None:
+        consumer_chunk_size = chunk_size
+    cap = HiddenCapture(teacher)
+    try:
+        carry = None
+        carry_mask = None
+        for i in range(0, len(sequences), chunk_size):
+            chunk_mask_cpu = attention_mask[i:i + chunk_size]
+            active_len = int(active_lengths_from_attention(chunk_mask_cpu).max().item())
+            chunk_seq = sequences[i:i + chunk_size, :active_len].to(
+                device, non_blocking=True
+            )
+            chunk_mask = chunk_mask_cpu[:, :active_len].to(device, non_blocking=True)
+            try:
+                with torch.inference_mode(), torch.cuda.device(device):
+                    teacher(input_ids=chunk_seq, attention_mask=chunk_mask)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    f"Teacher OOM with batch_size={chunk_seq.shape[0]}, "
+                    f"seq_len={chunk_seq.shape[1]}. Reduce TEACHER_MICRO_BATCH_SIZE "
+                    f"(currently {chunk_size})."
+                )
+            hidden = cap.hidden.to(student_device, non_blocking=True).detach()
+            hidden_mask = chunk_mask_cpu[:, :active_len]
+
+            if carry is not None:
+                target_len = max(carry.shape[1], hidden.shape[1])
+                carry = _pad_seq_dim(carry, target_len)
+                hidden = _pad_seq_dim(hidden, target_len)
+                carry_mask = _pad_seq_dim(carry_mask, target_len)
+                hidden_mask = _pad_seq_dim(hidden_mask, target_len)
+                hidden = torch.cat((carry, hidden), dim=0)
+                hidden_mask = torch.cat((carry_mask, hidden_mask), dim=0)
+                carry = None
+                carry_mask = None
+
+            emitted = 0
+            while emitted + consumer_chunk_size <= hidden.shape[0]:
+                piece_mask = hidden_mask[emitted:emitted + consumer_chunk_size]
+                piece_len = int(active_lengths_from_attention(piece_mask).max().item())
+                queue.put(hidden[emitted:emitted + consumer_chunk_size, :piece_len])
+                emitted += consumer_chunk_size
+            if emitted < hidden.shape[0]:
+                carry = hidden[emitted:]
+                carry_mask = hidden_mask[emitted:]
+        queue.put(None)
+    except Exception as e:
+        queue.put(e)
+        raise
+    finally:
+        cap.close()
+
+
 def generate_rollouts(
-    vllm_student, prompts, pad_token_id, group_size=1, max_context_length=4096, vocab_size=None
+    vllm_student, prompts, pad_token_id, group_size=1, max_context_length=4096, vocab_size=None,
+    with_logprobs=True, sort_by_length=False,
 ):
-    """Generate rollouts from student model using vLLM, returning sequences and prompt length."""
+    """Generate rollouts from student model using vLLM, returning sequences and prompt length.
+
+    If `with_logprobs=False`, the returned `old_logprobs` value is None. vLLM
+    `logprobs=1` adds nontrivial overhead, so callers that don't need importance
+    sampling should pass False.
+    """
     from vllm import SamplingParams
 
     prompt_lens = [len(p) for p in prompts]
@@ -266,7 +363,9 @@ def generate_rollouts(
         top_p=1.0,
         max_tokens=max_new_tokens,
         n=group_size,
-        logprobs=1,
+        logprobs=1 if with_logprobs else None,
+        stop_token_ids=[pad_token_id],
+        detokenize=False,
     )
 
     token_prompts = [{"prompt_token_ids": p} for p in prompts]
@@ -278,44 +377,92 @@ def generate_rollouts(
 
     # Convert vLLM outputs to tensor: each RequestOutput has `outputs` list
     # With n=group_size, we get group_size completions per prompt
-    all_sequences = []
-    all_logprobs = []
+    n_sequences = sum(len(req_output.outputs) for req_output in outputs)
+    max_seq_len = 0
     for req_output, prompt_len in zip(outputs, prompt_lens):
-        prompt_ids = req_output.prompt_token_ids
         for completion in req_output.outputs:
-            # Combine prompt + generated tokens
-            full_seq = list(prompt_ids) + list(completion.token_ids)
-            all_sequences.append(full_seq)
-            seq_logprobs = [0.0] * prompt_len
-            for idx, logprob_dict in enumerate(completion.logprobs):
-                token_id = completion.token_ids[idx]
-                seq_logprobs.append(logprob_dict[token_id].logprob)
-            all_logprobs.append(seq_logprobs)
+            max_seq_len = max(max_seq_len, prompt_len + len(completion.token_ids))
 
-    # Pad sequences to same length (right pad with pad_token_id)
-    max_seq_len = max(len(seq) for seq in all_sequences)
-    padded = [seq + [pad_token_id] * (max_seq_len - len(seq)) for seq in all_sequences]
-    padded_logprobs = [
-        logprob + [0.0] * (max_seq_len - len(logprob)) for logprob in all_logprobs
-    ]
+    sequences = torch.full((n_sequences, max_seq_len), pad_token_id, dtype=torch.long)
+    old_logprobs = (
+        torch.zeros((n_sequences, max_seq_len), dtype=torch.float32)
+        if with_logprobs else None
+    )
+    hit_eos = torch.empty(n_sequences, dtype=torch.bool)
+    expanded_prompt_lens = [0] * n_sequences
+    full_seq_lens = [0] * n_sequences  # per-row length used for attention_mask
 
-    sequences = torch.tensor(padded)
+    row = 0
+    for req_output, prompt_len in zip(outputs, prompt_lens):
+        prompt_tensor = torch.as_tensor(req_output.prompt_token_ids, dtype=torch.long)
+        for completion in req_output.outputs:
+            gen_len = len(completion.token_ids)
+            full_seq_len = prompt_len + gen_len
+            sequences[row, :prompt_len] = prompt_tensor
+            if gen_len:
+                sequences[row, prompt_len:full_seq_len] = torch.as_tensor(
+                    completion.token_ids, dtype=torch.long
+                )
+                if with_logprobs and completion.logprobs is not None:
+                    token_logprobs = [
+                        logprob_dict[token_id].logprob
+                        for token_id, logprob_dict in zip(
+                            completion.token_ids, completion.logprobs
+                        )
+                    ]
+                    old_logprobs[row, prompt_len:full_seq_len] = torch.as_tensor(
+                        token_logprobs, dtype=torch.float32
+                    )
+            hit_eos[row] = completion.finish_reason == "stop"
+            expanded_prompt_lens[row] = prompt_len
+            full_seq_lens[row] = full_seq_len
+            row += 1
+
     # Replace token IDs outside the shared vocab with pad so they're masked
     # out of attention and loss (student's padded vocab > teacher's vocab)
     if vocab_size is not None:
         sequences[sequences >= vocab_size] = pad_token_id
-    attention_mask = (sequences != pad_token_id).long()
-    old_logprobs = torch.tensor(padded_logprobs)
-    expanded_prompt_lens = [pl for pl in prompt_lens for _ in range(group_size)]
+    # Build attention_mask from per-row sequence ends (NOT token-id equality).
+    # When pad_token_id == eos_token_id (SmolLM2 case), token-equality would
+    # zero out internal EOS positions, denying gradient on EOS prediction.
+    attention_mask = torch.zeros_like(sequences, dtype=torch.long)
+    positions = torch.arange(max_seq_len).unsqueeze(0)
+    full_lens_t = torch.tensor(full_seq_lens, dtype=torch.long).unsqueeze(1)
+    attention_mask = (positions < full_lens_t).long()
 
-    return sequences, expanded_prompt_lens, old_logprobs, attention_mask
+    if sort_by_length and n_sequences > 1:
+        lengths = active_lengths_from_attention(attention_mask)
+        order = torch.argsort(lengths, descending=True)
+        order_list = order.tolist()
+        sequences = sequences[order]
+        if old_logprobs is not None:
+            old_logprobs = old_logprobs[order]
+        attention_mask = attention_mask[order]
+        hit_eos = hit_eos[order]
+        expanded_prompt_lens = [expanded_prompt_lens[i] for i in order_list]
+
+    if torch.cuda.is_available():
+        sequences = sequences.pin_memory()
+        if old_logprobs is not None:
+            old_logprobs = old_logprobs.pin_memory()
+        attention_mask = attention_mask.pin_memory()
+        hit_eos = hit_eos.pin_memory()
+
+    return sequences, expanded_prompt_lens, old_logprobs, attention_mask, hit_eos
 
 
 def prepare_prompts(opt_step_idx, all_batches, tokenizer, grad_accum_steps):
     """Get pretokenized prompts for a given optimizer step index."""
     chunk_start = opt_step_idx * grad_accum_steps
     chunk_end = chunk_start + grad_accum_steps
-    return [all_batches[i]["input_ids_prompt"] for i in range(chunk_start, chunk_end)]
+    prompts = []
+    for i in range(chunk_start, chunk_end):
+        p = all_batches[i]["input_ids_prompt"]
+        # dataset.iter(batch_size=1) wraps each row in an outer list
+        if isinstance(p[0], list):
+            p = p[0]
+        prompts.append(p)
+    return prompts
 
 
 def timed_generate_rollouts(*args, **kwargs):
@@ -325,13 +472,16 @@ def timed_generate_rollouts(*args, **kwargs):
     return (*result, time.time() - t0)
 
 
-def build_loss_mask(sequences, prompt_lens, pad_token_id):
+def build_loss_mask(sequences, prompt_lens, pad_token_id, attention_mask=None):
     """
     Build a mask that's 1.0 for completion tokens, 0.0 for prompt and padding.
 
     sequences: [batch, seq_len]
     prompt_lens: list[int], length = batch (per-sequence prompt lengths)
     pad_token_id: int
+    attention_mask: [batch, seq_len], optional. If provided, uses this to
+        determine valid (non-pad) positions instead of token-id equality —
+        which is critical when pad_token_id == eos_token_id (SmolLM2).
 
     Returns: [batch, seq_len - 1] (shifted to match logprob indexing)
     """
@@ -339,8 +489,27 @@ def build_loss_mask(sequences, prompt_lens, pad_token_id):
     positions = torch.arange(seq_len, device=sequences.device).unsqueeze(0)
     prompt_lens_t = torch.tensor(prompt_lens, device=sequences.device).unsqueeze(1)
     mask = (positions >= prompt_lens_t).float()
-    mask[sequences == pad_token_id] = 0.0
+    if attention_mask is not None:
+        mask = mask * attention_mask.float().to(mask.device)
+    else:
+        mask[sequences == pad_token_id] = 0.0
     return mask[:, 1:]
+
+
+def build_shift_labels(attention_mask, prompt_lens, ignore_index=-100):
+    """Build labels used only for ignore masking in the fused JSD kernel."""
+    batch_size, seq_len = attention_mask.shape
+    positions = torch.arange(seq_len, device=attention_mask.device).unsqueeze(0)
+    prompt_lens_t = torch.tensor(prompt_lens, device=attention_mask.device).unsqueeze(1)
+    valid = (positions >= prompt_lens_t) & attention_mask.bool()
+    labels = torch.full(
+        (batch_size, seq_len),
+        ignore_index,
+        dtype=torch.long,
+        device=attention_mask.device,
+    )
+    labels[valid] = 0
+    return labels[:, 1:].contiguous()
 
 
 def generate_samples(vllm_student, eval_prompts, tokenizer, max_context_length=4096):
@@ -349,10 +518,12 @@ def generate_samples(vllm_student, eval_prompts, tokenizer, max_context_length=4
 
     prompt_lens = [len(p) for p in eval_prompts]
     max_prompt_len = max(prompt_lens)
+    eos_id = tokenizer.eos_token_id
     sampling_params = SamplingParams(
         temperature=0.7,
         max_tokens=max_context_length - max_prompt_len,
         n=1,
+        stop_token_ids=[eos_id],
     )
     token_prompts = [{"prompt_token_ids": p} for p in eval_prompts]
     outputs = vllm_student.generate(
