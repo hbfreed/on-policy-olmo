@@ -11,10 +11,6 @@ from tqdm import tqdm
 
 import wandb
 
-# Adaptive sync bounds — used by get_sync_interval (legacy PG-shaped path).
-SYNC_MIN = 1
-SYNC_MAX = 1
-
 
 def pack_sequences(dataset, pack_length, pad_token_id, save_path=None):
     """First-fit-decreasing bin packing into fixed-length chunks.
@@ -133,29 +129,6 @@ def fused_partial_kl(student_logits, teacher_top_ids, teacher_top_lps, loss_mask
     teacher_probs = teacher_top_lps.exp()
     per_token_kl = (teacher_probs * (teacher_top_lps - student_at_tops)).sum(dim=-1)  # [B, T]
     return (per_token_kl * loss_mask).sum() / loss_mask.sum()
-
-
-def get_sync_interval(step, mean_ratio, approx_drift, current_interval, sync_state):
-    """Adaptive sync interval based on policy drift metrics.
-
-    sync_state: mutable dict with key 'steps_since_decrease' (int).
-    """
-    if step < 5:
-        return 1
-
-    # Danger — policy drifted too far, importance sampling unreliable
-    if abs(mean_ratio - 1.0) > 0.2 or approx_drift > 0.25:
-        sync_state["steps_since_decrease"] = 0
-        return max(SYNC_MIN, current_interval // 2)
-
-    sync_state["steps_since_decrease"] += 1
-
-    # Comfortable for a while — try pushing
-    if (abs(mean_ratio - 1.0) < 0.05 and approx_drift < 0.08
-            and sync_state["steps_since_decrease"] > 20):
-        return min(SYNC_MAX, current_interval + 1)
-
-    return current_interval
 
 
 def get_logprobs_at_tokens(logits, tokens, vocab_size=None, inplace=False):
