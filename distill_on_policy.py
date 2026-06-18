@@ -19,12 +19,14 @@ from distill_utils import (
     build_shift_labels,
     generate_rollouts,
     generate_samples,
+    init_weight_transfer,
     load_checkpoint,
     prepare_prompts,
     run_teacher_pipeline_hidden,
     save_checkpoint,
     timed_generate_rollouts,
     timed_sync_weights_to_vllm,
+    timed_sync_weights_to_vllm_native,
 )
 from evals import run_evals
 
@@ -234,12 +236,14 @@ def main():
     # skip_tokenizer_init=True since we input token IDs directly
     print(f"Loading vLLM student on {VLLM_DEVICE}...")
     torch.cuda.set_device(VLLM_DEVICE)
+    from vllm.config import WeightTransferConfig
     vllm_student = LLM(
         vllm_model_path,
         skip_tokenizer_init=True,
         tensor_parallel_size=1,
         dtype="bfloat16",
         max_model_len=max_context,
+        weight_transfer_config=WeightTransferConfig(backend="nccl"),
     )
     if vllm_model_path != student_load_path:
         import shutil
@@ -353,6 +357,10 @@ def main():
 
     # Set once to avoid per-step device switches
     torch.cuda.set_device(STUDENT_DEVICE)
+
+    # Native NCCL weight transfer: HF student (STUDENT_DEVICE) -> vLLM worker (VLLM_DEVICE).
+    # Direct GPU->GPU broadcast replacing the BytesIO/collective_rpc sync.
+    weight_transfer_group = init_weight_transfer(student, vllm_student, STUDENT_DEVICE)
 
     # Use a single-threaded executor to serialize all vLLM calls (generate/sync)
     vllm_executor = ThreadPoolExecutor(max_workers=1)
@@ -546,7 +554,8 @@ def main():
                     gen_future = None
                 if sync_future is None or sync_future.done():
                     sync_future = vllm_executor.submit(
-                        timed_sync_weights_to_vllm, student, vllm_student
+                        timed_sync_weights_to_vllm_native,
+                        student, vllm_student, weight_transfer_group, STUDENT_DEVICE,
                     )
 
             # Log generation quality samples (non-blocking)

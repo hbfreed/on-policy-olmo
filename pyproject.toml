@@ -15,7 +15,6 @@ dependencies = [
     "flash-attn>=2.8.3",
     "hf-transfer>=0.1.9",
     "vllm>=0.23",
-    "lm-eval[ifeval,vllm]>=0.4.0",
     "bitsandbytes>=0.49.1",
     "cut-cross-entropy>=0.1.0",
     "flashoptim>=0.1.2",

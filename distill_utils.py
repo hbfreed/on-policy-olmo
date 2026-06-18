@@ -3,6 +3,7 @@
 import io
 import os
 import shutil
+import threading
 import time
 
 import cloudpickle
@@ -639,4 +640,88 @@ def timed_sync_weights_to_vllm(hf_model, vllm_llm):
     """Time sync to help pick a data-driven SYNC_EVERY_N_STEPS."""
     start = time.time()
     sync_weights_to_vllm(hf_model, vllm_llm)
+    return time.time() - start
+
+
+def init_weight_transfer(hf_model, vllm_llm, student_device,
+                         master_addr="127.0.0.1", master_port=29512):
+    """Set up vLLM's native NCCL weight-transfer group (trainer <-> vLLM worker).
+
+    Replaces the BytesIO/collective_rpc transport (sync_weights_to_vllm) with a direct
+    GPU->GPU NCCL broadcast. The HF trainer is rank 0, the single vLLM worker (TP=1) is
+    rank 1; both rendezvous through a StatelessProcessGroup, so the two init calls must
+    run concurrently (the trainer side blocks until the worker joins) -- hence the thread.
+
+    Returns the trainer-side PyNcclCommunicator, passed to sync_weights_to_vllm_native.
+    """
+    from vllm.distributed.weight_transfer.base import WeightTransferInitRequest
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+    world_size = 2  # HF trainer + 1 vLLM worker
+
+    holder = {}
+
+    def _trainer_init():
+        # PyNcclCommunicator binds to the *current* CUDA device, so make the
+        # student's device current in this thread before creating the group.
+        with torch.cuda.device(student_device):
+            holder["group"] = NCCLWeightTransferEngine.trainer_init(dict(
+                master_address=master_addr, master_port=master_port,
+                world_size=world_size,
+            ))
+
+    thread = threading.Thread(target=_trainer_init)
+    thread.start()
+    vllm_llm.init_weight_transfer_engine(WeightTransferInitRequest(init_info=dict(
+        master_address=master_addr, master_port=master_port,
+        rank_offset=1, world_size=world_size,
+    )))
+    thread.join()
+    return holder["group"]
+
+
+def sync_weights_to_vllm_native(hf_model, vllm_llm, weight_transfer_group, student_device):
+    """GPU->GPU NCCL broadcast of HF student weights to the vLLM worker.
+
+    No CPU round-trip or pickling (cf. sync_weights_to_vllm). The worker's update_weights
+    blocks receiving on the NCCL group, so it runs in a thread while the trainer broadcasts
+    each tensor concurrently. Requires a prior init_weight_transfer.
+    """
+    from vllm.distributed.weight_transfer.base import WeightTransferUpdateRequest
+    from vllm.distributed.weight_transfer.nccl_engine import (
+        NCCLTrainerSendWeightsArgs,
+        NCCLWeightTransferEngine,
+    )
+
+    state_dict = hf_model.state_dict()
+    names = list(state_dict.keys())
+    update_info = dict(
+        names=names,
+        dtype_names=[str(state_dict[n].dtype).rsplit(".", 1)[-1] for n in names],
+        shapes=[list(state_dict[n].shape) for n in names],
+        packed=False,
+    )
+
+    # vLLM 0.23 enforces the phase sequence: start -> update -> finish.
+    vllm_llm.start_weight_update()
+    # Worker receives (blocking collective_rpc) in a thread; trainer broadcasts
+    # concurrently on the student's device. Names/order match on both sides.
+    recv = threading.Thread(
+        target=vllm_llm.update_weights,
+        args=(WeightTransferUpdateRequest(update_info=update_info),),
+    )
+    recv.start()
+    with torch.cuda.device(student_device):
+        NCCLWeightTransferEngine.trainer_send_weights(
+            ((name, state_dict[name]) for name in names),
+            NCCLTrainerSendWeightsArgs(group=weight_transfer_group, src=0, packed=False),
+        )
+    recv.join()
+    vllm_llm.finish_weight_update()
+
+
+def timed_sync_weights_to_vllm_native(hf_model, vllm_llm, weight_transfer_group, student_device):
+    """Native NCCL sync with timing (drop-in for timed_sync_weights_to_vllm)."""
+    start = time.time()
+    sync_weights_to_vllm_native(hf_model, vllm_llm, weight_transfer_group, student_device)
     return time.time() - start

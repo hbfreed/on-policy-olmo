@@ -2,10 +2,21 @@
 
 import os
 
-from lm_eval import simple_evaluate
-from lm_eval.models.huggingface import HFLM
-from lm_eval.models.vllm_causallms import VLLM
 from transformers import AutoConfig
+
+# lm-eval's vLLM backend imports vllm.entrypoints.chat_utils.resolve_hf_chat_template,
+# which vllm>=0.23 removed -- no lm-eval release supports vllm 0.23 yet. Guard the import
+# so the training scripts run without it; mid-training benchmark evals just skip.
+try:
+    from lm_eval import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
+    from lm_eval.models.vllm_causallms import VLLM
+    _LM_EVAL_AVAILABLE = True
+except ImportError as _lm_eval_err:  # vllm-version incompat or package removed
+    _LM_EVAL_AVAILABLE = False
+    _LM_EVAL_IMPORT_ERROR = _lm_eval_err
+    simple_evaluate = None
+    HFLM = VLLM = object  # harmless base so the subclasses below still define
 
 
 class VLLMFromExisting(VLLM):
@@ -87,6 +98,10 @@ def run_evals(vllm_llm, tokenizer, model_name, tasks=None, limit=200):
 
     Runs default tasks in one call, then tasks with custom fewshot in separate calls.
     """
+    if not _LM_EVAL_AVAILABLE:
+        print(f"[evals] lm-eval unavailable ({_LM_EVAL_IMPORT_ERROR}); skipping benchmarks.")
+        return {}
+
     if tasks is None:
         tasks = _DEFAULT_TASKS + list(_FEWSHOT_TASKS.keys())
 
