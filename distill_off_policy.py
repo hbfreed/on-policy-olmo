@@ -20,18 +20,6 @@ from transformers import AutoTokenizer
 
 import wandb
 from distill_utils import (
-    DATASET,
-    TEACHER,
-    STUDENT,
-    HUB_REPO,
-    STUDENT_DEVICE,
-    BATCH_SIZE,
-    N_EPOCHS,
-    MICRO_BATCH_SIZE,
-    MAX_CONTEXT_LENGTH,
-    MAX_GRAD_NORM,
-    WARMUP_STEPS,
-    DEBUG_MODE,
     build_loss_mask,
     save_checkpoint,
     load_checkpoint,
@@ -43,16 +31,38 @@ torch.backends.cudnn.benchmark = True
 torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
+# ============================================================
+# Config
+# ============================================================
+
 WANDB_PROJECT = "olmo-2-1b-off-policy-distillation"
 RUN_NAME = None
+HUB_REPO = None
 
+# Models / data
+TEACHER = "allenai/Olmo-3-7B-Instruct"
+STUDENT = "allenai/OLMo-2-0425-1B-Instruct"
+DATASET = "allenai/Dolci-Instruct-RL"
+
+# Devices
 VLLM_DEVICES = ["cuda:0", "cuda:1"]  # two data-parallel teacher instances
+STUDENT_DEVICE = "cuda:2"
 
-GRAD_ACCUM_STEPS = 64
+# Training
 LR = 3e-5
-MIN_LR_RATIO = 0.1  # decay to 10% of peak LR
-DECAY_FRACTION = 0.2  # WSD: last 20% is cosine decay
+N_EPOCHS = 1
+BATCH_SIZE = 1
+MICRO_BATCH_SIZE = 2
+GRAD_ACCUM_STEPS = 64
+MAX_CONTEXT_LENGTH = 2048
+MAX_GRAD_NORM = 3.0
+WARMUP_STEPS = 50
+MIN_LR_RATIO = 0.1     # decay to 10% of peak LR
+DECAY_FRACTION = 0.2   # WSD: last 20% is cosine decay
 TEACHER_TOP_K = 128
+
+# Eval / logging
+DEBUG_MODE = False
 
 torch.manual_seed(1223)
 
